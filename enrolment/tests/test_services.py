@@ -1,4 +1,4 @@
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from core.test_helpers import LogInHelper
 from enrolment.services import build_individual_enrolment_selection
@@ -6,6 +6,7 @@ from individual.tests.test_helpers import create_group_with_individual, create_i
 from social_protection.tests.test_helpers import create_benefit_plan
 
 
+@override_settings(ROW_SECURITY=False)
 class IndividualEnrolmentSelectionTest(TestCase):
     @classmethod
     def setUpClass(cls):

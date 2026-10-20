@@ -67,6 +67,7 @@ class Query(graphene.ObjectType):
             kwargs.get("customFilters"),
             kwargs.get("benefitPlanId"),
             kwargs.get("status"),
+            info.context.user,
         ))
 
     def resolve_enrolment_individual_candidate(self, info, **kwargs):
@@ -95,6 +96,7 @@ class Query(graphene.ObjectType):
             kwargs.get("customFilters"),
             kwargs.get("benefitPlanId"),
             kwargs.get("status"),
+            info.context.user,
         ))
 
     def resolve_enrolment_group_candidate(self, info, **kwargs):

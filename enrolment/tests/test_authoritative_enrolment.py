@@ -416,6 +416,7 @@ class EnrollmentPreviewResolverTest(SimpleTestCase):
         self.assertIs(result, selected)
 
 
+@override_settings(ROW_SECURITY=False)
 class AuthoritativeEnrollmentTest(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -701,6 +702,7 @@ class AuthoritativeEnrollmentTest(TestCase):
             custom_filters=[],
             benefit_plan_id=str(benefit_plan.id),
             status="ACTIVE",
+            user=self.user,
         )
 
         selected_ids = set(result.values_list("id", flat=True))
@@ -731,10 +733,52 @@ class AuthoritativeEnrollmentTest(TestCase):
             custom_filters=['district__exact__string="Lilongwe"'],
             benefit_plan_id=str(benefit_plan.id),
             status="ACTIVE",
+            user=self.user,
         )
 
         selected_ids = set(result.values_list("id", flat=True))
         self.assertEqual(selected_ids, {selected.id})
+
+    def test_mandatory_and_saved_phase_criteria_are_anded(self):
+        SocialProtectionConfig.mandatory_enrollment_criteria = {
+            "INDIVIDUAL": {
+                "ACTIVE": [{
+                    "field": "district",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "Lilongwe",
+                }]
+            },
+            "GROUP": {},
+        }
+        benefit_plan = self._benefit_plan("INDIVIDUAL")
+        selected = create_individual(self.user.username, {
+            "json_ext": {
+                "validation_status": "VERIFIED",
+                "district": "Lilongwe",
+            }
+        })
+        create_individual(self.user.username, {
+            "json_ext": {
+                "validation_status": "VERIFIED",
+                "district": "Blantyre",
+            }
+        })
+        create_individual(self.user.username, {
+            "json_ext": {
+                "validation_status": "PENDING",
+                "district": "Lilongwe",
+            }
+        })
+
+        result = build_individual_enrollment_queryset(
+            custom_filters=[],
+            benefit_plan_id=str(benefit_plan.id),
+            status="ACTIVE",
+            user=self.user,
+        )
+
+        self.assertEqual(set(result.values_list("id", flat=True)), {selected.id})
 
     def test_rejects_operator_filter_outside_phase_schema(self):
         benefit_plan = self._benefit_plan("INDIVIDUAL")
@@ -744,6 +788,7 @@ class AuthoritativeEnrollmentTest(TestCase):
                 custom_filters=['unconfigured__exact__string="value"'],
                 benefit_plan_id=str(benefit_plan.id),
                 status="ACTIVE",
+                user=self.user,
             )
 
     def test_group_confirmation_uses_group_json_ext(self):
@@ -759,6 +804,7 @@ class AuthoritativeEnrollmentTest(TestCase):
             custom_filters=[],
             benefit_plan_id=str(benefit_plan.id),
             status="ACTIVE",
+            user=self.user,
         )
 
         selected_ids = set(result.values_list("id", flat=True))
@@ -794,6 +840,7 @@ class AuthoritativeEnrollmentTest(TestCase):
             custom_filters=[],
             benefit_plan_id=str(benefit_plan.id),
             status="POTENTIAL",
+            user=self.user,
         )
 
         self.assertEqual(set(result.values_list("id", flat=True)), {eligible.id})
@@ -804,6 +851,7 @@ class AuthoritativeEnrollmentTest(TestCase):
             ],
             benefit_plan_id=str(benefit_plan.id),
             status="POTENTIAL",
+            user=self.user,
         )
         self.assertFalse(attempted_replacement.exists())
 
@@ -815,6 +863,7 @@ class AuthoritativeEnrollmentTest(TestCase):
                 custom_filters=[],
                 benefit_plan_id=str(group_plan.id),
                 status="ACTIVE",
+                user=self.user,
             )
 
     def test_numeric_json_ranking_and_percentage_cap_are_applied_together(self):
@@ -1191,4 +1240,5 @@ class AuthoritativeEnrollmentTest(TestCase):
                 custom_filters=[],
                 benefit_plan_id=str(benefit_plan.id),
                 status="UNKNOWN",
+                user=self.user,
             )
