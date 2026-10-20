@@ -9,12 +9,18 @@ from enrolment.criteria import load_enrolment_phase
 from enrolment.ranking import rank_and_cap_queryset
 
 
-def build_individual_enrolment_queryset(custom_filters, benefit_plan_id, status):
-    return INDIVIDUAL_SOURCE.eligible_queryset(custom_filters, benefit_plan_id, status)
+def build_individual_enrolment_queryset(
+    custom_filters, benefit_plan_id, status, user=None
+):
+    return INDIVIDUAL_SOURCE.eligible_queryset(
+        custom_filters, benefit_plan_id, status, user
+    )
 
 
-def build_group_enrolment_queryset(custom_filters, benefit_plan_id, status):
-    return GROUP_SOURCE.eligible_queryset(custom_filters, benefit_plan_id, status)
+def build_group_enrolment_queryset(custom_filters, benefit_plan_id, status, user=None):
+    return GROUP_SOURCE.eligible_queryset(
+        custom_filters, benefit_plan_id, status, user
+    )
 
 
 def _build_selection(
@@ -33,7 +39,9 @@ def _build_selection(
         status,
         source.phase_type,
     )
-    eligible = source.eligible_queryset(custom_filters, benefit_plan_id, status)
+    eligible = source.eligible_queryset(
+        custom_filters, benefit_plan_id, status, user
+    )
     active_assignment = assignment_model.objects.filter(
         **{
             f"{assignment_field}_id": OuterRef("pk"),
@@ -116,11 +124,14 @@ def build_group_enrolment_selection(
     }
 
 
-def build_individual_enrolment_summary(custom_filters, benefit_plan_id, status):
+def build_individual_enrolment_summary(
+    custom_filters, benefit_plan_id, status, user=None
+):
     selection = build_individual_enrolment_selection(
         custom_filters,
         benefit_plan_id,
         status,
+        user,
     )
     query = selection["individual_query_with_filters"]
     active_assignment = Beneficiary.objects.filter(
@@ -137,7 +148,9 @@ def build_individual_enrolment_summary(custom_filters, benefit_plan_id, status):
     not_assigned_count = query.filter(_assigned_to_any_plan=False).count()
     return {
         "number_of_selected_individuals": selected_count,
-        "total_number_of_individuals": Individual.objects.filter(is_deleted=False).count(),
+        "total_number_of_individuals": INDIVIDUAL_SOURCE.authorized_queryset(
+            user
+        ).count(),
         "number_of_individuals_not_assigned_to_programme": not_assigned_count,
         "number_of_individuals_assigned_to_programme": selected_count - not_assigned_count,
         "number_of_individuals_assigned_to_selected_programme": query.filter(
@@ -148,8 +161,12 @@ def build_individual_enrolment_summary(custom_filters, benefit_plan_id, status):
     }
 
 
-def build_group_enrolment_summary(custom_filters, benefit_plan_id, status):
-    selection = build_group_enrolment_selection(custom_filters, benefit_plan_id, status)
+def build_group_enrolment_summary(
+    custom_filters, benefit_plan_id, status, user=None
+):
+    selection = build_group_enrolment_selection(
+        custom_filters, benefit_plan_id, status, user
+    )
     query = selection["group_query_with_filters"]
     active_assignment = GroupBeneficiary.objects.filter(
         group_id=OuterRef("pk"),
@@ -165,7 +182,7 @@ def build_group_enrolment_summary(custom_filters, benefit_plan_id, status):
     not_assigned_count = query.filter(_assigned_to_any_plan=False).count()
     return {
         "number_of_selected_groups": selected_count,
-        "total_number_of_groups": Group.objects.filter(is_deleted=False).count(),
+        "total_number_of_groups": GROUP_SOURCE.authorized_queryset(user).count(),
         "number_of_groups_not_assigned_to_programme": not_assigned_count,
         "number_of_groups_assigned_to_programme": selected_count - not_assigned_count,
         "number_of_groups_assigned_to_selected_programme": query.filter(
