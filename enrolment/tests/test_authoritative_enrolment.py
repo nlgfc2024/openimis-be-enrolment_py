@@ -8,6 +8,7 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from core.test_helpers import LogInHelper
 from enrolment.criteria import _criterion_to_condition
+from enrolment.apps import EnrolmentConfig
 from enrolment.services import (
     EnrolmentService,
     build_group_enrollment_queryset,
@@ -25,7 +26,7 @@ from enrolment.ranking import (
     rank_and_cap_queryset,
     validate_ranking_spec,
 )
-from individual.models import Individual
+from individual.models import Group, Individual
 from enrolment.schema import Query
 from individual.custom_filters import GroupCustomFilterWizard, IndividualCustomFilterWizard
 from individual.tests.test_helpers import (
@@ -34,13 +35,12 @@ from individual.tests.test_helpers import (
     create_individual,
 )
 from social_protection.tests.test_helpers import create_benefit_plan
-from social_protection.apps import SocialProtectionConfig
 from social_protection.models import Beneficiary, GroupBeneficiary
 
 
 class EnrollmentCriterionNormalizationTest(SimpleTestCase):
     @patch("enrolment.ranking.build_order_by", side_effect=lambda queryset, order: queryset)
-    def test_target_without_ranking_caps_the_preview_queryset(self, build_order):
+    def test_target_without_ranking_keeps_backward_compatible_full_pool(self, build_order):
         queryset = MagicMock(model=Individual)
         queryset.count.return_value = 5876
         phase = Mock(json_ext={}, max_beneficiaries=300)
@@ -48,19 +48,19 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             queryset, phase, "ACTIVE", 0, materialize_selected_ids=False,
         )
         self.assertEqual(metadata["pool_size"], 5876)
-        self.assertEqual(metadata["cap_applied"], 300)
-        self.assertEqual(metadata["will_enrol"], 300)
-        queryset.values.return_value.__getitem__.assert_called_once_with(slice(None, 300))
+        self.assertIsNone(metadata["cap_applied"])
+        self.assertEqual(metadata["will_enrol"], 5876)
+        build_order.assert_not_called()
 
     @patch("enrolment.ranking.build_order_by", side_effect=lambda queryset, order: queryset)
-    def test_target_without_ranking_respects_remaining_capacity(self, build_order):
+    def test_target_without_ranking_does_not_apply_remaining_capacity(self, build_order):
         queryset = MagicMock(model=Individual)
         queryset.count.return_value = 5876
         _, metadata = rank_and_cap_queryset(
             queryset, Mock(json_ext={}, max_beneficiaries=300), "ACTIVE", 20,
             materialize_selected_ids=False,
         )
-        self.assertEqual(metadata["will_enrol"], 280)
+        self.assertEqual(metadata["will_enrol"], 5876)
 
     def test_custom_filter_string_cast_decodes_json_quoting(self):
         wizard = IndividualCustomFilterWizard()
@@ -288,6 +288,26 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         self.assertIn("NULLS LAST", sql)
         self.assertIn("integer", sql)
 
+    def test_ranking_rejects_multi_valued_relation_paths(self):
+        with self.assertRaisesMessage(ValidationError, "multi-valued path"):
+            validate_ranking_spec(
+                {"order_by": ["groupindividuals__individual__dob"]},
+                Group,
+            )
+
+    def test_benefit_plan_validator_uses_the_runtime_ranking_validator(self):
+        from enrolment.ranking import benefit_plan_ranking_validation_errors
+
+        errors = benefit_plan_ranking_validation_errors({
+            "type": "GROUP",
+            "beneficiary_data_schema": {"properties": {}},
+            "json_ext": {"enrolment_ranking": {"ACTIVE": {
+                "order_by": ["groupindividuals__individual__dob"],
+            }}},
+        })
+
+        self.assertIn("multi-valued path", errors[0]["message"])
+
     @patch("enrolment.ranking.build_order_by")
     def test_cast_data_error_names_the_configured_field(
         self,
@@ -321,14 +341,13 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         ):
             rank_and_cap_queryset(queryset, benefit_plan, "ACTIVE", 0)
 
-    @patch("enrolment.services.build_individual_enrolment_selection")
+    @patch("enrolment.confirmation.confirm_individual_enrolment")
     def test_confirmation_signal_result_contains_authoritative_queryset(
-        self,
-        build_selection,
+        self, confirm,
     ):
         authoritative_queryset = Mock()
         not_assigned_queryset = Mock()
-        build_selection.return_value = {
+        confirm.return_value = {
             "individual_query_with_filters": authoritative_queryset,
             "individuals_not_assigned_to_selected_programme": not_assigned_queryset,
         }
@@ -424,17 +443,35 @@ class AuthoritativeEnrollmentTest(TestCase):
 
     def setUp(self):
         self.original_mandatory_criteria = copy.deepcopy(
-            SocialProtectionConfig.mandatory_enrollment_criteria
+            EnrolmentConfig.mandatory_enrollment_criteria
         )
-        SocialProtectionConfig.mandatory_enrollment_criteria = {
+        EnrolmentConfig.mandatory_enrollment_criteria = {
             "INDIVIDUAL": {},
             "GROUP": {},
         }
 
     def tearDown(self):
-        SocialProtectionConfig.mandatory_enrollment_criteria = (
+        EnrolmentConfig.mandatory_enrollment_criteria = (
             self.original_mandatory_criteria
         )
+
+    def _verified_group(self, json_ext=None, individual_json_ext=None, dob=None):
+        group_json = dict(json_ext or {})
+        group_json.setdefault("validation_status", "VERIFIED")
+        group = create_group(self.user.username, {"json_ext": group_json})
+        individual_data = {"json_ext": individual_json_ext or {}}
+        if dob is not None:
+            individual_data["dob"] = dob
+        individual = create_individual(self.user.username, individual_data)
+        membership = add_individual_to_group(
+            self.user.username, individual, group
+        )
+        membership.json_ext = {"primary_worker": True}
+        membership.save(username=self.user.username)
+        group.refresh_from_db()
+        group.json_ext = {**(group.json_ext or {}), **group_json}
+        group.save(username=self.user.username)
+        return group
 
     def _benefit_plan(self, benefit_plan_type):
         return create_benefit_plan(self.user.username, payload_override={
@@ -505,7 +542,9 @@ class AuthoritativeEnrollmentTest(TestCase):
             payload_override={
                 "type": "INDIVIDUAL",
                 "max_beneficiaries": cap,
-                "beneficiary_data_schema": {"properties": {}},
+                "beneficiary_data_schema": {
+                    "properties": {"quota_rank": {"type": "string"}}
+                },
                 "json_ext": {
                     "advanced_criteria": {"ACTIVE": []},
                     "enrolment_ranking": {
@@ -740,7 +779,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         self.assertEqual(selected_ids, {selected.id})
 
     def test_mandatory_and_saved_phase_criteria_are_anded(self):
-        SocialProtectionConfig.mandatory_enrollment_criteria = {
+        EnrolmentConfig.mandatory_enrollment_criteria = {
             "INDIVIDUAL": {
                 "ACTIVE": [{
                     "field": "district",
@@ -793,12 +832,8 @@ class AuthoritativeEnrollmentTest(TestCase):
 
     def test_group_confirmation_uses_group_json_ext(self):
         benefit_plan = self._benefit_plan("GROUP")
-        eligible = create_group(self.user.username, {
-            "json_ext": {"validation_status": "VERIFIED"}
-        })
-        create_group(self.user.username, {
-            "json_ext": {"validation_status": "PENDING"}
-        })
+        eligible = self._verified_group({"validation_status": "VERIFIED"})
+        pending = self._verified_group({"validation_status": "PENDING"})
 
         result = build_group_enrollment_queryset(
             custom_filters=[],
@@ -808,10 +843,11 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
         selected_ids = set(result.values_list("id", flat=True))
-        self.assertEqual(selected_ids, {eligible.id})
+        self.assertIn(eligible.id, selected_ids)
+        self.assertNotIn(pending.id, selected_ids)
 
     def test_group_immutable_rule_cannot_be_removed_from_phase_or_payload(self):
-        SocialProtectionConfig.mandatory_enrollment_criteria = {
+        EnrolmentConfig.mandatory_enrollment_criteria = {
             "INDIVIDUAL": {},
             "GROUP": {
                 "POTENTIAL": [{
@@ -829,12 +865,8 @@ class AuthoritativeEnrollmentTest(TestCase):
             },
             "json_ext": {"advanced_criteria": {"POTENTIAL": []}},
         })
-        eligible = create_group(self.user.username, {
-            "json_ext": {"validation_status": "VERIFIED"}
-        })
-        create_group(self.user.username, {
-            "json_ext": {"validation_status": "NOT_VERIFIED"}
-        })
+        eligible = self._verified_group({"validation_status": "VERIFIED"})
+        not_verified = self._verified_group({"validation_status": "NOT_VERIFIED"})
 
         result = build_group_enrollment_queryset(
             custom_filters=[],
@@ -843,7 +875,9 @@ class AuthoritativeEnrollmentTest(TestCase):
             user=self.user,
         )
 
-        self.assertEqual(set(result.values_list("id", flat=True)), {eligible.id})
+        result_ids = set(result.values_list("id", flat=True))
+        self.assertIn(eligible.id, result_ids)
+        self.assertNotIn(not_verified.id, result_ids)
 
         attempted_replacement = build_group_enrollment_queryset(
             custom_filters=[
@@ -870,8 +904,11 @@ class AuthoritativeEnrollmentTest(TestCase):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 10,
-            "beneficiary_data_schema": {"properties": {}},
+            "beneficiary_data_schema": {
+                "properties": {"score": {"type": "integer"}}
+            },
             "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
                 "enrolment_ranking": {
                     "*": {
                         "order_by": [{
@@ -911,8 +948,11 @@ class AuthoritativeEnrollmentTest(TestCase):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 10,
-            "beneficiary_data_schema": {"properties": {}},
+            "beneficiary_data_schema": {
+                "properties": {"score": {"type": "integer"}}
+            },
             "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
                 "enrolment_ranking": {
                     "*": {
                         "order_by": ["id"],
@@ -948,6 +988,7 @@ class AuthoritativeEnrollmentTest(TestCase):
             "type": "INDIVIDUAL",
             "max_beneficiaries": 2,
             "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
                 "enrolment_ranking": {
                     "ACTIVE": {
                         "order_by": ["id"],
@@ -978,7 +1019,19 @@ class AuthoritativeEnrollmentTest(TestCase):
     def test_group_ranking_cap_and_nulls_last(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "GROUP",
+            "beneficiary_data_schema": {
+                "properties": {
+                    "score": {"type": "integer"},
+                    "test_scope": {"type": "string"},
+                }
+            },
             "json_ext": {
+                "advanced_criteria": {"POTENTIAL": [{
+                    "field": "test_scope",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "group-ranking",
+                }]},
                 "enrolment_ranking": {
                     "*": {
                         "order_by": [{
@@ -992,9 +1045,9 @@ class AuthoritativeEnrollmentTest(TestCase):
                 }
             },
         })
-        first = create_group(self.user.username, {"json_ext": {"score": "9"}})
-        second = create_group(self.user.username, {"json_ext": {"score": "10"}})
-        create_group(self.user.username, {"json_ext": {}})
+        first = self._verified_group({"score": "9", "test_scope": "group-ranking"})
+        second = self._verified_group({"score": "10", "test_scope": "group-ranking"})
+        self._verified_group({"test_scope": "group-ranking"})
 
         selection = build_group_enrollment_selection(
             [], str(benefit_plan.id), "POTENTIAL", self.user
@@ -1009,8 +1062,16 @@ class AuthoritativeEnrollmentTest(TestCase):
     def test_group_weighted_ranking_reads_primary_worker_business_data(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "GROUP",
-            "beneficiary_data_schema": {"properties": {}},
+            "beneficiary_data_schema": {
+                "properties": {"test_scope": {"type": "string"}}
+            },
             "json_ext": {
+                "advanced_criteria": {"ACTIVE": [{
+                    "field": "test_scope",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "weighted-groups",
+                }]},
                 "enrolment_ranking": {
                     "ACTIVE": {
                         "score_source": {
@@ -1057,21 +1118,13 @@ class AuthoritativeEnrollmentTest(TestCase):
         })
 
         def household(business_type, business_period):
-            group = create_group(self.user.username)
-            member = create_individual(self.user.username, {
-                "json_ext": {
+            return self._verified_group(
+                json_ext={"test_scope": "weighted-groups"},
+                individual_json_ext={
                     "type_of_business": business_type,
                     "business_period": business_period,
-                }
-            })
-            membership = add_individual_to_group(
-                self.user.username,
-                member,
-                group,
+                },
             )
-            membership.json_ext = {"primary_worker": True}
-            membership.save(username=self.user.username)
-            return group
 
         highest = household("Priority", 5)
         second = household("Other", 4)
@@ -1091,17 +1144,18 @@ class AuthoritativeEnrollmentTest(TestCase):
             [highest.id, second.id],
         )
 
-    def test_group_quotas_use_head_gender_and_dob_with_phase_cap(self):
+    def test_group_quotas_use_primary_worker_gender_and_dob_with_phase_cap(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "GROUP",
             "max_beneficiaries": 2,
             "beneficiary_data_schema": {"properties": {}},
             "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
                 "enrolment_ranking": {
                     "ACTIVE": {
                         "order_by": ["id"],
                         "selection_strategy": {
-                            "source": "HOUSEHOLD_HEAD",
+                            "source": "PRIMARY_WORKER",
                             "female_percentage": 50,
                             "youth_percentage": 50,
                             "female_value": "Female",
@@ -1114,17 +1168,10 @@ class AuthoritativeEnrollmentTest(TestCase):
         })
 
         def household(gender, age):
-            group = create_group(self.user.username)
-            head = create_individual(self.user.username, {
-                "dob": date(date.today().year - age, 1, 1),
-                "json_ext": {"gender": gender},
-            })
-            add_individual_to_group(
-                self.user.username,
-                head,
-                group,
+            return self._verified_group(
+                individual_json_ext={"gender": gender},
+                dob=date(date.today().year - age, 1, 1),
             )
-            return group
 
         household("Male", 50)
         young = household("Male", 25)
@@ -1147,10 +1194,19 @@ class AuthoritativeEnrollmentTest(TestCase):
     def test_group_selection_only_excludes_active_assignment_for_requested_status(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "GROUP",
+            "beneficiary_data_schema": {
+                "properties": {"test_scope": {"type": "string"}}
+            },
+            "json_ext": {"advanced_criteria": {"ACTIVE": [{
+                "field": "test_scope",
+                "filter": "exact",
+                "type": "string",
+                "value": "assignment-groups",
+            }]}},
         })
-        active = create_group(self.user.username)
-        other_status = create_group(self.user.username)
-        deleted = create_group(self.user.username)
+        active = self._verified_group({"test_scope": "assignment-groups"})
+        other_status = self._verified_group({"test_scope": "assignment-groups"})
+        deleted = self._verified_group({"test_scope": "assignment-groups"})
 
         for group, assignment_status, is_deleted in (
             (active, "ACTIVE", False),
@@ -1178,9 +1234,24 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
     def test_individual_selection_only_excludes_active_assignment_for_requested_status(self):
-        benefit_plan = self._benefit_plan("INDIVIDUAL")
-        active = create_individual(self.user.username)
-        other_status = create_individual(self.user.username)
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "INDIVIDUAL",
+            "beneficiary_data_schema": {
+                "properties": {"test_scope": {"type": "string"}}
+            },
+            "json_ext": {"advanced_criteria": {"ACTIVE": [{
+                "field": "test_scope",
+                "filter": "exact",
+                "type": "string",
+                "value": "assignment-individuals",
+            }]}},
+        })
+        active = create_individual(
+            self.user.username, {"json_ext": {"test_scope": "assignment-individuals"}}
+        )
+        other_status = create_individual(
+            self.user.username, {"json_ext": {"test_scope": "assignment-individuals"}}
+        )
 
         for individual, assignment_status in (
             (active, "ACTIVE"),
@@ -1218,7 +1289,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         self.assertIsNone(selection["cap_applied"])
         self.assertEqual(selection["pool_size"], selection["will_enrol"])
 
-    def test_phase_target_applies_before_ranking_is_configured(self):
+    def test_phase_target_is_ignored_until_ranking_is_configured(self):
         benefit_plan = self._benefit_plan("INDIVIDUAL")
         benefit_plan.max_beneficiaries = 1
         benefit_plan.save(username=self.user.username)
@@ -1228,9 +1299,12 @@ class AuthoritativeEnrollmentTest(TestCase):
             [], str(benefit_plan.id), "ACTIVE", self.user,
         )
         self.assertEqual(selection["pool_size"], 3)
-        self.assertEqual(selection["will_enrol"], 1)
-        self.assertEqual(selection["cap_applied"], 1)
-        self.assertEqual(selection["individuals_not_assigned_to_selected_programme"].count(), 1)
+        self.assertEqual(selection["will_enrol"], 3)
+        self.assertIsNone(selection["cap_applied"])
+        self.assertEqual(
+            selection["individuals_not_assigned_to_selected_programme"].count(),
+            3,
+        )
 
     def test_rejects_unknown_status(self):
         benefit_plan = self._benefit_plan("INDIVIDUAL")

@@ -4,9 +4,9 @@ from django.apps import apps
 from django.core.exceptions import ValidationError
 
 from individual.apps import IndividualConfig
+from enrolment.apps import EnrolmentConfig
 
 
-DEFAULT_BENEFICIARY_STATUS = "POTENTIAL"
 FILTERS_BY_TYPE = {
     "string": {
         "exact", "iexact", "startswith", "istartswith", "contains", "icontains",
@@ -54,9 +54,7 @@ def merge_enrolment_criteria(custom_filters, benefit_plan_id, status, expected_t
     )
     validate_operator_filters(operator_filters, benefit_plan)
 
-    from social_protection.apps import SocialProtectionConfig
-
-    configured = SocialProtectionConfig.mandatory_enrollment_criteria or {}
+    configured = EnrolmentConfig.mandatory_enrollment_criteria or {}
     system_criteria = configured.get(expected_type or benefit_plan.type, {}) or {}
 
     json_ext = benefit_plan.json_ext or {}
@@ -68,7 +66,7 @@ def merge_enrolment_criteria(custom_filters, benefit_plan_id, status, expected_t
 
     criteria = json_ext.get("advanced_criteria", {}) or {}
     if isinstance(criteria, list):
-        criteria = {DEFAULT_BENEFICIARY_STATUS: criteria}
+        criteria = {EnrolmentConfig.default_beneficiary_status: criteria}
 
     combined_filters = []
     seen = set()
@@ -157,6 +155,40 @@ def criterion_to_condition(entry):
     if value_type == "string":
         value = json.dumps(value)
     return f"{field}__{filter_name}__{value_type}={value}"
+
+
+def validate_mandatory_enrolment_criteria(criteria):
+    if not isinstance(criteria, dict):
+        raise ValidationError({"config": [
+            "mandatory_enrollment_criteria must be an object."
+        ]})
+    unexpected = set(criteria) - {"INDIVIDUAL", "GROUP"}
+    errors = []
+    if unexpected:
+        errors.append(
+            "Unsupported mandatory_enrollment_criteria types: "
+            + ", ".join(sorted(unexpected))
+        )
+    for plan_type in ("INDIVIDUAL", "GROUP"):
+        statuses = criteria.get(plan_type, {})
+        if not isinstance(statuses, dict):
+            errors.append(
+                f"mandatory_enrollment_criteria.{plan_type} must be an object."
+            )
+            continue
+        for status, entries in statuses.items():
+            if not isinstance(status, str) or not isinstance(entries, list):
+                errors.append(
+                    f"mandatory_enrollment_criteria.{plan_type} entries must be lists."
+                )
+                continue
+            if any(not criterion_to_condition(entry) for entry in entries):
+                errors.append(
+                    f"mandatory_enrollment_criteria.{plan_type}.{status} "
+                    "contains a malformed criterion."
+                )
+    if errors:
+        raise ValidationError({"config": errors})
 
 
 # Compatibility aliases for callers using the earlier names.
