@@ -10,8 +10,10 @@ from core.gql.gql_mutations.base_mutation import (
 from core.schema import OpenIMISMutation
 from individual.apps import IndividualConfig
 from individual.models import Group, Individual
+from social_protection.apps import SocialProtectionConfig
 
 from enrolment.services import EnrolmentService
+from enrolment.apps import EnrolmentConfig
 
 
 class ConfirmEnrolmentInputType(OpenIMISMutation.Input):
@@ -28,7 +30,7 @@ class _ConfirmEnrolmentMixin:
         return (
             data.pop("custom_filters", None),
             data.pop("benefit_plan_id", None),
-            data.pop("status", "ACTIVE"),
+            data.pop("status", EnrolmentConfig.default_beneficiary_status),
         )
 
 
@@ -45,6 +47,11 @@ class ConfirmIndividualEnrolmentMutation(
     def _validate_mutation(cls, user, **data):
         super()._validate_mutation(user, **data)
         if not user.has_perms(IndividualConfig.gql_individual_create_perms):
+            raise PermissionDenied(_("unauthorized"))
+        if not user.has_perms(
+            SocialProtectionConfig.gql_beneficiary_create_perms
+            + SocialProtectionConfig.gql_benefit_plan_update_perms
+        ):
             raise PermissionDenied(_("unauthorized"))
 
     @classmethod
@@ -75,6 +82,11 @@ class ConfirmGroupEnrolmentMutation(
     def _validate_mutation(cls, user, **data):
         super()._validate_mutation(user, **data)
         if not user.has_perms(IndividualConfig.gql_group_create_perms):
+            raise PermissionDenied(_("unauthorized"))
+        if not user.has_perms(
+            SocialProtectionConfig.gql_beneficiary_create_perms
+            + SocialProtectionConfig.gql_benefit_plan_update_perms
+        ):
             raise PermissionDenied(_("unauthorized"))
 
     @classmethod

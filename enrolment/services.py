@@ -33,15 +33,17 @@ def _build_selection(
     status,
     user=None,
     materialize_selected_ids=True,
+    candidate_ids=None,
+    benefit_plan=None,
 ):
-    benefit_plan = load_enrolment_phase(
-        benefit_plan_id,
-        status,
-        source.phase_type,
+    benefit_plan = benefit_plan or load_enrolment_phase(
+        benefit_plan_id, status, source.phase_type
     )
     eligible = source.eligible_queryset(
         custom_filters, benefit_plan_id, status, user
     )
+    if candidate_ids is not None:
+        eligible = eligible.filter(id__in=candidate_ids)
     active_assignment = assignment_model.objects.filter(
         **{
             f"{assignment_field}_id": OuterRef("pk"),
@@ -74,6 +76,8 @@ def build_individual_enrolment_selection(
     status,
     user=None,
     materialize_selected_ids=True,
+    candidate_ids=None,
+    benefit_plan=None,
 ):
     _, eligible, assigned, selected, metadata = _build_selection(
         source=INDIVIDUAL_SOURCE,
@@ -84,6 +88,8 @@ def build_individual_enrolment_selection(
         status=status,
         user=user,
         materialize_selected_ids=materialize_selected_ids,
+        candidate_ids=candidate_ids,
+        benefit_plan=benefit_plan,
     )
     return {
         "individuals_assigned_to_selected_programme": assigned,
@@ -102,6 +108,8 @@ def build_group_enrolment_selection(
     status,
     user=None,
     materialize_selected_ids=True,
+    candidate_ids=None,
+    benefit_plan=None,
 ):
     _, eligible, assigned, selected, metadata = _build_selection(
         source=GROUP_SOURCE,
@@ -112,6 +120,8 @@ def build_group_enrolment_selection(
         status=status,
         user=user,
         materialize_selected_ids=materialize_selected_ids,
+        candidate_ids=candidate_ids,
+        benefit_plan=benefit_plan,
     )
     return {
         "groups_assigned_to_selected_programme": assigned,
@@ -132,6 +142,7 @@ def build_individual_enrolment_summary(
         benefit_plan_id,
         status,
         user,
+        materialize_selected_ids=False,
     )
     query = selection["individual_query_with_filters"]
     active_assignment = Beneficiary.objects.filter(
@@ -165,7 +176,11 @@ def build_group_enrolment_summary(
     custom_filters, benefit_plan_id, status, user=None
 ):
     selection = build_group_enrolment_selection(
-        custom_filters, benefit_plan_id, status, user
+        custom_filters,
+        benefit_plan_id,
+        status,
+        user,
+        materialize_selected_ids=False,
     )
     query = selection["group_query_with_filters"]
     active_assignment = GroupBeneficiary.objects.filter(
@@ -211,22 +226,20 @@ class EnrolmentService:
     def select_individuals_to_benefit_plan(
         self, custom_filters, benefit_plan_id, status, user=None
     ):
-        return build_individual_enrolment_selection(
-            custom_filters,
-            benefit_plan_id,
-            status,
-            user or self.user,
+        from enrolment.confirmation import confirm_individual_enrolment
+
+        return confirm_individual_enrolment(
+            custom_filters, benefit_plan_id, status, user or self.user
         )
 
     @register_service_signal("enrolment_service.select_groups_to_benefit_plan")
     def select_groups_to_benefit_plan(
         self, custom_filters, benefit_plan_id, status, user=None
     ):
-        return build_group_enrolment_selection(
-            custom_filters,
-            benefit_plan_id,
-            status,
-            user or self.user,
+        from enrolment.confirmation import confirm_group_enrolment
+
+        return confirm_group_enrolment(
+            custom_filters, benefit_plan_id, status, user or self.user
         )
 
 

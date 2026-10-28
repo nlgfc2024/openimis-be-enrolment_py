@@ -2,6 +2,7 @@ import graphene
 import graphene_django_optimizer as gql_optimizer
 
 from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import PermissionDenied
 
 from individual.apps import IndividualConfig
 from individual.gql_queries import GroupGQLType, IndividualGQLType
@@ -29,7 +30,7 @@ def _check_permissions(user, permissions):
         or not getattr(user, "id", None)
         or not user.has_perms(permissions)
     ):
-        raise PermissionError("Unauthorized")
+        raise PermissionDenied("Unauthorized")
 
 
 class Query(graphene.ObjectType):
