@@ -15,5 +15,6 @@ setup(
         "openimis-be-core",
         "openimis-be-individual",
         "openimis-be-social_protection",
+        "openimis-be-tasks_management",
     ],
 )

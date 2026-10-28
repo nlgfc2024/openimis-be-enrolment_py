@@ -1,0 +1,27 @@
+name: Module CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+      - develop
+      - 'release/**'
+      - 'feature/**'
+      - 'feat/**'
+  workflow_dispatch:
+
+jobs:
+  call:
+    name: Default CI Flow
+    uses: nlgfc2024/openimis-be_py/.github/workflows/ci_module.yml@mw/develop
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    with:
+      SONAR_PROJECT_KEY: nlgfc2024_openimis-be-enrolment_py
+      SONAR_ORGANIZATION: openimis-1
+      SONAR_PROJECT_NAME: openimis-be-enrolment_py
+      SONAR_PROJECT_VERSION: 0.1
+      SONAR_SOURCES: enrolment
+      SONAR_EXCLUSIONS: "**/migrations/**,**/tests/**"
