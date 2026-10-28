@@ -20,6 +20,9 @@ from django.db.models import (
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast
 
+from enrolment.apps import EnrolmentConfig
+from enrolment.membership import authoritative_primary_worker_memberships
+
 
 SUPPORTED_CASTS = {
     "int": IntegerField,
@@ -59,27 +62,33 @@ def load_ranking_spec(benefit_plan, status):
     return ranking
 
 
-def _validate_model_path(model, path, extra_fields=None):
+def _validate_model_path(model, path, extra_fields=None, schema_fields=None):
     if not isinstance(path, str) or not path:
         raise ValidationError("Ranking fields must be non-empty strings.")
-    if path in (extra_fields or set()):
+    if path in (extra_fields or set()) or path in (schema_fields or set()):
         return
     parts = path.split("__")
-    current_model = model
-    for index, part in enumerate(parts):
-        try:
-            field = current_model._meta.get_field(part)
-        except (FieldDoesNotExist, AttributeError) as exc:
-            raise ValidationError(f"Unsupported ranking field: {path}.") from exc
-        if index == 0 and part == "json_ext" and len(parts) > 1:
-            return
-        if index < len(parts) - 1:
-            current_model = field.related_model
-            if current_model is None:
-                raise ValidationError(f"Unsupported ranking field: {path}.")
+    if parts[0] == "json_ext" and len(parts) == 2 and parts[1]:
+        if schema_fields and parts[1] not in schema_fields:
+            raise ValidationError(
+                f"Ranking field {path} is not defined in beneficiary_data_schema."
+            )
+        return
+    if len(parts) != 1:
+        raise ValidationError(
+            f"Ranking field {path} cannot cross a related or multi-valued path."
+        )
+    try:
+        field = model._meta.get_field(path)
+    except (FieldDoesNotExist, AttributeError) as exc:
+        raise ValidationError(f"Unsupported ranking field: {path}.") from exc
+    if not field.concrete or field.many_to_many or field.one_to_many:
+        raise ValidationError(f"Unsupported ranking field: {path}.")
 
 
-def _normalise_order_item(item, model, index, extra_fields=None):
+def _normalise_order_item(
+    item, model, index, extra_fields=None, schema_fields=None
+):
     if isinstance(item, str):
         direction = "desc" if item.startswith("-") else "asc"
         field = item[1:] if item.startswith("-") else item
@@ -96,7 +105,12 @@ def _normalise_order_item(item, model, index, extra_fields=None):
     else:
         raise ValidationError(f"enrolment_ranking.order_by[{index}] must be a string or object.")
 
-    _validate_model_path(model, result.get("field"), extra_fields)
+    _validate_model_path(
+        model,
+        result.get("field"),
+        extra_fields,
+        schema_fields,
+    )
     if result["direction"] not in SUPPORTED_DIRECTIONS:
         raise ValidationError(f"Unsupported ranking direction: {result['direction']}.")
     if result.get("cast") not in ({None} | set(SUPPORTED_CASTS)):
@@ -296,10 +310,9 @@ def _normalise_selection_strategy(selection_strategy, model):
             raise ValidationError(
                 "INDIVIDUAL selection_strategy.source must be SELF."
             )
-    elif source not in {HOUSEHOLD_HEAD_SOURCE, PRIMARY_WORKER_SOURCE}:
+    elif source != PRIMARY_WORKER_SOURCE:
         raise ValidationError(
-            "GROUP selection_strategy.source must be HOUSEHOLD_HEAD or "
-            "PRIMARY_WORKER."
+            "GROUP selection_strategy.source must be PRIMARY_WORKER."
         )
 
     female = selection_strategy.get("female_percentage", 0)
@@ -355,7 +368,9 @@ def _normalise_selection_strategy(selection_strategy, model):
     }
 
 
-def validate_ranking_spec(ranking, model):
+def validate_ranking_spec(ranking, model, beneficiary_schema=None):
+    if not isinstance(ranking, dict):
+        raise ValidationError("enrolment_ranking status entries must be objects.")
     unexpected = set(ranking) - {
         "order_by",
         "tie_breaker",
@@ -383,9 +398,21 @@ def validate_ranking_spec(ranking, model):
     order_by = ranking.get("order_by", [])
     if not isinstance(order_by, list):
         raise ValidationError("enrolment_ranking.order_by must be a list.")
+    properties = (
+        beneficiary_schema.get("properties", {})
+        if isinstance(beneficiary_schema, dict)
+        else {}
+    )
+    schema_fields = set(properties) if isinstance(properties, dict) else set()
     extra_fields = {WEIGHTED_SCORE_FIELD} if weighted_score is not None else set()
     normalised = [
-        _normalise_order_item(item, model, index, extra_fields)
+        _normalise_order_item(
+            item,
+            model,
+            index,
+            extra_fields,
+            schema_fields,
+        )
         for index, item in enumerate(order_by)
     ]
     if weighted_score is not None and not any(
@@ -397,7 +424,7 @@ def validate_ranking_spec(ranking, model):
         )
 
     tie_breaker = ranking.get("tie_breaker", "id")
-    _validate_model_path(model, tie_breaker)
+    _validate_model_path(model, tie_breaker, schema_fields=schema_fields)
     normalised = [item for item in normalised if item["field"] != tie_breaker]
     normalised.append({"field": tie_breaker, "direction": "asc"})
 
@@ -421,7 +448,63 @@ def validate_ranking_spec(ranking, model):
     respect_max = limit.get("respect_max_beneficiaries", True)
     if not isinstance(respect_max, bool):
         raise ValidationError("enrolment_ranking.limit.respect_max_beneficiaries must be boolean.")
+    if weighted_score is not None and not score_source and schema_fields:
+        for index, component in enumerate(weighted_score["components"]):
+            if component["field"] not in schema_fields:
+                raise ValidationError(
+                    "enrolment_ranking.weighted_score.components"
+                    f"[{index}].field {component['field']} is not defined in "
+                    "beneficiary_data_schema."
+                )
     return normalised, percentage, respect_max
+
+
+def benefit_plan_ranking_validation_errors(data, existing=None):
+    """Shared Social Protection validator-registry callback."""
+    from individual.models import Group, Individual
+    from social_protection.models import BeneficiaryStatus, BenefitPlan
+
+    if existing is not None and not hasattr(existing, "json_ext"):
+        existing = BenefitPlan.objects.filter(id=existing).first()
+
+    json_ext = data.get("json_ext")
+    if json_ext is None and existing is not None:
+        json_ext = existing.json_ext
+    if isinstance(json_ext, str):
+        try:
+            json_ext = json.loads(json_ext)
+        except (TypeError, ValueError):
+            return []  # Social Protection owns base json_ext validation.
+    if not isinstance(json_ext, dict) or "enrolment_ranking" not in json_ext:
+        return []
+    rankings = json_ext["enrolment_ranking"]
+    if not isinstance(rankings, dict):
+        return [{"message": "enrolment_ranking must be an object."}]
+
+    plan_type = data.get("type") or getattr(existing, "type", "INDIVIDUAL")
+    model = Group if plan_type == "GROUP" else Individual
+    schema = data.get("beneficiary_data_schema")
+    if schema is None and existing is not None:
+        schema = existing.beneficiary_data_schema
+    errors = []
+    supported_statuses = set(BeneficiaryStatus.values) | {"*"}
+    for status, ranking in rankings.items():
+        if not isinstance(status, str) or not status:
+            errors.append({"message": "enrolment_ranking status keys must be strings."})
+            continue
+        if status not in supported_statuses:
+            errors.append({
+                "message": f"enrolment_ranking has unsupported status {status}."
+            })
+            continue
+        try:
+            validate_ranking_spec(ranking, model, schema)
+        except ValidationError as exc:
+            errors.extend(
+                {"message": f"enrolment_ranking.{status}: {message}"}
+                for message in exc.messages
+            )
+    return errors
 
 
 def _maximum_points(scoring):
@@ -438,12 +521,8 @@ def _score_source_expression(field, score_source):
     if not score_source:
         return KeyTextTransform(field, "json_ext")
 
-    from individual.models import GroupIndividual
-
-    primary_worker = GroupIndividual.objects.filter(
-        group_id=OuterRef("pk"),
-        is_deleted=False,
-        json_ext__primary_worker=True,
+    primary_worker = authoritative_primary_worker_memberships().filter(
+        group_id=OuterRef("pk")
     ).order_by("id")
     value = KeyTextTransform(field, "individual__json_ext")
     return Subquery(
@@ -527,23 +606,32 @@ def _age_range_dob(today, minimum_age, maximum_age):
 def _annotate_selection_source(queryset, source):
     if source == SELF_SOURCE:
         return queryset.annotate(
-            _selection_gender=KeyTextTransform("gender", "json_ext"),
+            _selection_gender=KeyTextTransform(
+                EnrolmentConfig.registry_gender_field,
+                "json_ext",
+            ),
             _selection_dob=F("dob"),
         )
 
     from individual.models import GroupIndividual
 
-    member = GroupIndividual.objects.filter(
-        group_id=OuterRef("pk"),
-        is_deleted=False,
-        individual__is_deleted=False,
-    ).order_by("id")
     if source == HOUSEHOLD_HEAD_SOURCE:
-        member = member.filter(role=GroupIndividual.Role.HEAD)
+        member = GroupIndividual.objects.filter(
+            group_id=OuterRef("pk"),
+            is_deleted=False,
+            group__is_deleted=False,
+            individual__is_deleted=False,
+            role=GroupIndividual.Role.HEAD,
+        ).order_by("id")
     else:
-        member = member.filter(json_ext__primary_worker=True)
+        member = authoritative_primary_worker_memberships().filter(
+            group_id=OuterRef("pk")
+        ).order_by("id")
 
-    gender = KeyTextTransform("gender", "individual__json_ext")
+    gender = KeyTextTransform(
+        EnrolmentConfig.registry_gender_field,
+        "individual__json_ext",
+    )
     return queryset.annotate(
         _selection_gender=Subquery(
             member.annotate(_value=gender).values("_value")[:1],
@@ -626,10 +714,18 @@ def build_order_by(queryset, order_items):
     ordering = []
     for index, item in enumerate(order_items):
         alias = f"_enrolment_rank_{index}"
-        expression = F(item["field"])
+        field_name = item["field"]
+        expression = F(field_name)
+        if field_name.startswith("json_ext__"):
+            expression = KeyTextTransform.from_lookup(field_name)
+        elif field_name != WEIGHTED_SCORE_FIELD:
+            try:
+                queryset.model._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                # A beneficiary-schema property is stored in json_ext but may be
+                # configured without the explicit json_ext__ prefix.
+                expression = KeyTextTransform(field_name, "json_ext")
         if item.get("cast"):
-            if item["field"].startswith("json_ext__"):
-                expression = KeyTextTransform.from_lookup(item["field"])
             expression = Cast(expression, output_field=SUPPORTED_CASTS[item["cast"]]())
         annotations[alias] = expression
         order_expression = F(alias)
@@ -679,7 +775,7 @@ def rank_and_cap_queryset(
     """
     ranking = load_ranking_spec(benefit_plan, status)
     pool_size = queryset.count()
-    if ranking is None and benefit_plan.max_beneficiaries is None:
+    if ranking is None:
         return queryset, {
             "pool_size": pool_size,
             "cap_applied": None,
@@ -689,13 +785,10 @@ def rank_and_cap_queryset(
             "selected_ids": None,
         }
 
-    # A phase's explicit capacity remains effective before optional ranking rules
-    # are configured or approved. Use deterministic ordering for the capped pool.
-    if ranking is None:
-        ranking = {"order_by": ["id"], "limit": {"respect_max_beneficiaries": True}}
-
     order_items, percentage, respect_max = validate_ranking_spec(
-        ranking, queryset.model
+        ranking,
+        queryset.model,
+        benefit_plan.beneficiary_data_schema,
     )
     weighted_score = ranking.get("weighted_score")
     score_source = ranking.get("score_source")

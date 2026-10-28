@@ -1,9 +1,14 @@
 from django.contrib.auth.models import AnonymousUser
+from django.db.models import Count, Exists, OuterRef
 
 from core.custom_filters import CustomFilterWizardStorage
 from individual.models import Group, Individual
 
 from enrolment.criteria import merge_enrolment_criteria
+from enrolment.membership import (
+    active_household_memberships,
+    primary_worker_membership_filter,
+)
 
 
 class IndividualCandidateSource:
@@ -23,9 +28,12 @@ class IndividualCandidateSource:
             status,
             self.phase_type,
         )
-        # Household membership does not disqualify a person from an individual
-        # programme such as RMEP. Programme membership is handled by explicit
-        # Phase criteria and assignment checks instead.
+        active_membership = active_household_memberships().filter(
+            individual_id=OuterRef("pk")
+        )
+        query = query.annotate(
+            _has_active_household_membership=Exists(active_membership)
+        ).filter(_has_active_household_membership=False)
         return CustomFilterWizardStorage.build_custom_filters_queryset(
             "individual",
             "Individual",
@@ -42,7 +50,12 @@ class GroupCandidateSource:
         return Group.get_queryset(queryset, user or AnonymousUser()).distinct()
 
     def eligible_queryset(self, custom_filters, benefit_plan_id, status, user=None):
-        query = self.authorized_queryset(user)
+        query = self.authorized_queryset(user).annotate(
+            _authoritative_primary_workers=Count(
+                "groupindividuals",
+                filter=primary_worker_membership_filter(),
+            )
+        ).filter(_authoritative_primary_workers=1)
         filters = merge_enrolment_criteria(
             custom_filters,
             benefit_plan_id,

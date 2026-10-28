@@ -9,13 +9,14 @@ from enrolment.services import (
     build_individual_enrolment_selection,
     build_individual_enrolment_summary,
 )
+from enrolment.apps import EnrolmentConfig
 from individual.models import Group, Individual
 from individual.tests.test_helpers import (
     IndividualGQLTestCase,
     create_group,
     create_individual,
+    add_individual_to_group,
 )
-from social_protection.apps import SocialProtectionConfig
 from social_protection.tests.test_helpers import create_benefit_plan
 
 
@@ -47,23 +48,40 @@ class EnrolmentRowSecurityTest(IndividualGQLTestCase):
             cls.admin_user.username, {"location": cls.village_b}
         )
         cls.group_a = create_group(
-            cls.admin_user.username, {"location": cls.village_a}
+            cls.admin_user.username,
+            {"location": cls.village_a, "json_ext": {"validation_status": "VERIFIED"}},
         )
         cls.group_b = create_group(
-            cls.admin_user.username, {"location": cls.village_b}
+            cls.admin_user.username,
+            {"location": cls.village_b, "json_ext": {"validation_status": "VERIFIED"}},
         )
+        for group in (cls.group_a, cls.group_b):
+            individual = create_individual(
+                cls.admin_user.username, {"location": group.location}
+            )
+            membership = add_individual_to_group(
+                cls.admin_user.username, individual, group
+            )
+            membership.json_ext = {"primary_worker": True}
+            membership.save(username=cls.admin_user.username)
+            group.refresh_from_db()
+            group.json_ext = {
+                **(group.json_ext or {}),
+                "validation_status": "VERIFIED",
+            }
+            group.save(username=cls.admin_user.username)
 
     def setUp(self):
         self.original_mandatory_criteria = copy.deepcopy(
-            SocialProtectionConfig.mandatory_enrollment_criteria
+            EnrolmentConfig.mandatory_enrollment_criteria
         )
-        SocialProtectionConfig.mandatory_enrollment_criteria = {
+        EnrolmentConfig.mandatory_enrollment_criteria = {
             "INDIVIDUAL": {},
             "GROUP": {},
         }
 
     def tearDown(self):
-        SocialProtectionConfig.mandatory_enrollment_criteria = (
+        EnrolmentConfig.mandatory_enrollment_criteria = (
             self.original_mandatory_criteria
         )
 
