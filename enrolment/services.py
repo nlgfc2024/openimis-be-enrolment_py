@@ -35,6 +35,7 @@ def _build_selection(
     materialize_selected_ids=True,
     candidate_ids=None,
     benefit_plan=None,
+    apply_percentage_limit=True,
 ):
     benefit_plan = benefit_plan or load_enrolment_phase(
         benefit_plan_id, status, source.phase_type
@@ -66,6 +67,7 @@ def _build_selection(
         status,
         current_count,
         materialize_selected_ids=materialize_selected_ids,
+        apply_percentage_limit=apply_percentage_limit,
     )
     return benefit_plan, eligible, assigned, selected, metadata
 
@@ -78,6 +80,7 @@ def build_individual_enrolment_selection(
     materialize_selected_ids=True,
     candidate_ids=None,
     benefit_plan=None,
+    apply_percentage_limit=True,
 ):
     _, eligible, assigned, selected, metadata = _build_selection(
         source=INDIVIDUAL_SOURCE,
@@ -90,6 +93,7 @@ def build_individual_enrolment_selection(
         materialize_selected_ids=materialize_selected_ids,
         candidate_ids=candidate_ids,
         benefit_plan=benefit_plan,
+        apply_percentage_limit=apply_percentage_limit,
     )
     return {
         "individuals_assigned_to_selected_programme": assigned,
@@ -110,6 +114,7 @@ def build_group_enrolment_selection(
     materialize_selected_ids=True,
     candidate_ids=None,
     benefit_plan=None,
+    apply_percentage_limit=True,
 ):
     _, eligible, assigned, selected, metadata = _build_selection(
         source=GROUP_SOURCE,
@@ -122,6 +127,7 @@ def build_group_enrolment_selection(
         materialize_selected_ids=materialize_selected_ids,
         candidate_ids=candidate_ids,
         benefit_plan=benefit_plan,
+        apply_percentage_limit=apply_percentage_limit,
     )
     return {
         "groups_assigned_to_selected_programme": assigned,

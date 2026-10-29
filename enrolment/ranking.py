@@ -767,11 +767,14 @@ def rank_and_cap_queryset(
     status,
     current_enrolment_count,
     materialize_selected_ids=True,
+    apply_percentage_limit=True,
 ):
     """Apply deterministic ordering and the configured intake ceiling.
 
     The returned metadata is shared by preview and execution. ``pool_size`` is the
     unassigned eligible pool, while ``will_enrol`` is the sliced queryset size.
+    Approval revalidation can disable the percentage limit after it was applied
+    during confirmation without disabling the remaining capacity limit.
     """
     ranking = load_ranking_spec(benefit_plan, status)
     pool_size = queryset.count()
@@ -805,7 +808,7 @@ def rank_and_cap_queryset(
     ranked = apply_ranking(queryset)
     cap, has_limit = calculate_cap(
         pool_size,
-        percentage,
+        percentage if apply_percentage_limit else None,
         benefit_plan.max_beneficiaries,
         current_enrolment_count,
         respect_max,

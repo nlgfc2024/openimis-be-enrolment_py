@@ -230,6 +230,7 @@ def _complete_individual_approval(
         user,
         candidate_ids=staged_ids,
         benefit_plan=benefit_plan,
+        apply_percentage_limit=False,
     )
     duplicates = Beneficiary.objects.filter(
         benefit_plan=benefit_plan,
@@ -286,6 +287,7 @@ def _complete_group_approval(user, benefit_plan, upload_id, status, custom_filte
         user,
         candidate_ids=group_ids,
         benefit_plan=benefit_plan,
+        apply_percentage_limit=False,
     )
     duplicates = GroupBeneficiary.objects.filter(
         benefit_plan=benefit_plan,
