@@ -4,8 +4,13 @@ from unittest.mock import patch
 
 from core.models.base_mutation import MutationLog
 from enrolment.apps import EnrolmentConfig
-from enrolment.services import EnrolmentService
+from enrolment.services import (
+    EnrolmentService,
+    build_group_enrolment_selection,
+    build_individual_enrolment_selection,
+)
 from enrolment.schema import Mutation as EnrolmentMutation, Query as EnrolmentQuery
+from individual.models import IndividualDataSource
 from individual.schema import Mutation as IndividualMutation, Query as IndividualQuery
 from individual.tests.test_helpers import (
     BaseTestContext,
@@ -81,6 +86,37 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
         }
         group.save(username=self.admin_user.username)
         return individual, group, membership
+
+    def _percentage_plan(self, plan_type, token):
+        return create_benefit_plan(
+            self.admin_user.username,
+            payload_override={
+                "type": plan_type,
+                "max_beneficiaries": 10,
+                "beneficiary_data_schema": {
+                    "properties": {"enrolment_test": {"type": "string"}}
+                },
+                "json_ext": {
+                    "advanced_criteria": {
+                        "ACTIVE": [{
+                            "field": "enrolment_test",
+                            "filter": "exact",
+                            "type": "string",
+                            "value": token,
+                        }]
+                    },
+                    "enrolment_ranking": {
+                        "ACTIVE": {
+                            "order_by": ["id"],
+                            "limit": {
+                                "percentage": 50,
+                                "respect_max_beneficiaries": True,
+                            },
+                        }
+                    },
+                },
+            },
+        )
 
     @patch.object(
         EnrolmentConfig, "enable_maker_checker_logic_enrollment", False
@@ -249,6 +285,62 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     @patch(
         "enrolment.confirmation.BeneficiaryImportService."
+        "synchronize_data_for_reporting"
+    )
+    def test_individual_percentage_limit_is_not_reapplied_at_approval(
+        self, _synchronize
+    ):
+        token = "percentage-individual"
+        plan = self._percentage_plan("INDIVIDUAL", token)
+        for _ in range(10):
+            create_individual(
+                self.admin_user.username,
+                {"json_ext": {"enrolment_test": token}},
+            )
+
+        preview = build_individual_enrolment_selection(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        self.assertEqual(preview["pool_size"], 10)
+        self.assertEqual(preview["will_enrol"], 5)
+        self.assertEqual(
+            preview["individuals_not_assigned_to_selected_programme"].count(),
+            5,
+        )
+
+        confirmation = EnrolmentService(
+            self.admin_user
+        ).select_individuals_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        self.assertEqual(confirmation["will_enrol"], 5)
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        self.assertEqual(
+            IndividualDataSource.objects.filter(
+                upload_id=record.data_upload_id, is_deleted=False
+            ).count(),
+            5,
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(
+            Beneficiary.objects.filter(
+                benefit_plan=plan, status="ACTIVE", is_deleted=False
+            ).count(),
+            5,
+        )
+
+    @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
+    @patch(
+        "enrolment.confirmation.BeneficiaryImportService."
         "synchronize_data_for_reporting",
         side_effect=ValidationError("reporting failed"),
     )
@@ -310,6 +402,38 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
                 individual=individual, benefit_plan=plan, is_deleted=False
             ).count(),
             1,
+        )
+
+    @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
+    def test_approval_rejects_candidate_that_becomes_ineligible(self):
+        plan = self._plan("INDIVIDUAL", "eligible-while-staged")
+        individual = create_individual(
+            self.admin_user.username,
+            {"json_ext": {"enrolment_test": "eligible-while-staged"}},
+        )
+        EnrolmentService(self.admin_user).select_individuals_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+        individual.json_ext = {
+            **(individual.json_ext or {}),
+            "enrolment_test": "no-longer-eligible",
+        }
+        individual.save(username=self.admin_user.username)
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertFalse(
+            Beneficiary.objects.filter(
+                individual=individual, benefit_plan=plan, is_deleted=False
+            ).exists()
         )
 
     @patch.object(
@@ -398,6 +522,53 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
                 status="ACTIVE",
                 is_deleted=False,
             ).exists()
+        )
+
+    @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
+    def test_group_percentage_limit_is_not_reapplied_at_approval(self):
+        token = "percentage-group"
+        plan = self._percentage_plan("GROUP", token)
+        for _ in range(10):
+            self._verified_group(token)
+
+        preview = build_group_enrolment_selection(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        self.assertEqual(preview["pool_size"], 10)
+        self.assertEqual(preview["will_enrol"], 5)
+        self.assertEqual(
+            preview["groups_not_assigned_to_selected_programme"].count(),
+            5,
+        )
+
+        confirmation = EnrolmentService(
+            self.admin_user
+        ).select_groups_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        self.assertEqual(confirmation["will_enrol"], 5)
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        self.assertEqual(
+            IndividualDataSource.objects.filter(
+                upload_id=record.data_upload_id, is_deleted=False
+            ).count(),
+            5,
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(
+            GroupBeneficiary.objects.filter(
+                benefit_plan=plan, status="ACTIVE", is_deleted=False
+            ).count(),
+            5,
         )
 
     @patch.object(
