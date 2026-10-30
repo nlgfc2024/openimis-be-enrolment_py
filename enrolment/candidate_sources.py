@@ -5,6 +5,7 @@ from core.custom_filters import CustomFilterWizardStorage
 from individual.models import Group, Individual
 
 from enrolment.criteria import merge_enrolment_criteria
+from enrolment.district import apply_district_filters, scoped_groups
 from enrolment.membership import (
     active_household_memberships,
     primary_worker_membership_filter,
@@ -47,7 +48,7 @@ class GroupCandidateSource:
 
     def authorized_queryset(self, user=None):
         queryset = Group.objects.filter(is_deleted=False)
-        return Group.get_queryset(queryset, user or AnonymousUser()).distinct()
+        return scoped_groups(queryset, user).distinct()
 
     def eligible_queryset(self, custom_filters, benefit_plan_id, status, user=None):
         query = self.authorized_queryset(user).annotate(
@@ -62,6 +63,7 @@ class GroupCandidateSource:
             status,
             self.phase_type,
         )
+        query, filters = apply_district_filters(query, filters, user)
         return CustomFilterWizardStorage.build_custom_filters_queryset(
             "individual",
             "Group",

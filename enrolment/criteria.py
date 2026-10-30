@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError
 
 from individual.apps import IndividualConfig
 from enrolment.apps import EnrolmentConfig
+from enrolment.district import DISTRICT_FIELD, district_from_condition
 
 
 FILTERS_BY_TYPE = {
@@ -117,6 +118,17 @@ def validate_operator_filters(custom_filters, benefit_plan):
             filter_name = "exact"
         else:
             raise ValidationError("Malformed enrolment operator filter.")
+
+        if field == DISTRICT_FIELD:
+            if benefit_plan.type != "GROUP":
+                raise ValidationError("District enrollment filtering is only supported for households.")
+            # A registry fallback schema must never enable a phase-only operator.
+            phase_schema = benefit_plan.beneficiary_data_schema or {}
+            if isinstance(phase_schema, str):
+                phase_schema = json.loads(phase_schema)
+            if field not in phase_schema.get("properties", {}):
+                raise ValidationError("District enrollment filter is not allowed by this phase.")
+            district_from_condition(condition)
 
         definition = properties.get(field)
         if not isinstance(definition, dict):
