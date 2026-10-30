@@ -16,6 +16,9 @@ class IndividualSummaryEnrolmentGQLType(graphene.ObjectType):
 
 
 class GroupSummaryEnrolmentGQLType(graphene.ObjectType):
+    verified_unenrolled_households = graphene.Int()
+    phase_target = graphene.Int()
+    enrolled_households = graphene.Int()
     number_of_selected_groups = graphene.String()
     total_number_of_groups = graphene.String()
     number_of_groups_not_assigned_to_programme = graphene.String()
