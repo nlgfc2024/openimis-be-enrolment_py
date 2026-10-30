@@ -26,6 +26,9 @@ def district_from_condition(condition):
         or int(value) > 2147483647
     ):
         raise ValidationError("District filter requires Equals and a positive integer location ID.")
+    from enrolment.apps import EnrolmentConfig
+    if EnrolmentConfig.enable_household_district_filter is not True:
+        raise ValidationError("Household district filtering is disabled.")
     district = Location.objects.filter(
         id=int(value), type="R", *Location.filter_validity()
     ).first()

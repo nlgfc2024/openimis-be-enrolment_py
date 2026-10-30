@@ -31,39 +31,22 @@ Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
 against current registry and beneficiary data in the same transaction.
 
-## Prepare district filter configuration
+## Optional household district filter
 
-After deploying district-filter support, GROUP phases must expose
-`district_id: {"type": "integer"}` in their beneficiary data schema.
-Creation defaults only affect new phases; existing phases must be targeted explicitly.
-The configuration remains owned by Social Protection.
+Set `enable_household_district_filter: true` in the backend `enrolment`
+ModuleConfiguration to enable the reserved `district_id__exact__integer=<R ID>`
+operator. The default is false. Only GROUP enrolment supports it; backend
+validation rejects district conditions when disabled even if sent directly by API
+clients or included in saved criteria. Active District (R), location permissions,
+primary-worker eligibility and approval-time revalidation still apply.
 
-Export the complete Social Protection module configuration and the phases to
-prepare into this wrapper (replace the example with actual exported values):
+Set the same boolean in the exposed frontend `fe-enrolment` module configuration
+to offer the picker. The frontend setting controls presentation only; it cannot
+enable an operator disabled by the backend. Do not expose backend configuration
+records merely to configure the frontend.
 
-```json
-{
-  "module_config": {"benefit_plan_creation_defaults": {}},
-  "phases": [{"id": "phase-uuid", "type": "GROUP", "beneficiary_data_schema": {}}]
-}
-```
-
-From the configured backend application, run:
-
-```sh
-python manage.py prepare_enrolment_district_config before.json proposed.json --phase-id phase-uuid
-```
-
-Repeat `--phase-id` to select multiple existing GROUP phases. Omit it to prepare
-creation defaults only. The command preserves unrelated properties, phase criteria
-(including VERIFIED), and existing district field metadata. It rejects conflicting
-types, invalid exports, unknown/non-GROUP/duplicate selected phase IDs, and existing
-output paths. Repeated preparation is idempotent at the JSON content level.
-
-The handler reads and writes files only and disables system/migration checks;
-normal Django application startup still uses the configured application environment.
-It does not read or update phase records or ModuleConfiguration. Review the JSON
-diff, then apply only the intended defaults/schema additions using supported
-administration/API paths. The wrapper is not a bulk API payload. Keep an original
-export for rollback, and check for concurrent changes before applying. Do not add
-district to mandatory criteria or overwrite existing eligibility rules.
+No Phase schema or Social Protection creation-default edits are required.
+`district_id` is a location relationship filter, not beneficiary JSON data.
+The former schema-preparation command has been removed. If its proposed schema
+additions were previously applied, review and remove only those additions through
+supported administration paths, preserving real data fields and eligibility rules.

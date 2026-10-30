@@ -88,7 +88,7 @@ def merge_enrolment_criteria(custom_filters, benefit_plan_id, status, expected_t
     return combined_filters
 
 
-def validate_operator_filters(custom_filters, benefit_plan):
+def _operator_filter_properties(benefit_plan):
     schema = benefit_plan.beneficiary_data_schema or {}
     if isinstance(schema, str):
         try:
@@ -104,8 +104,11 @@ def validate_operator_filters(custom_filters, benefit_plan):
                 schema = json.loads(fallback_schema)
             except (TypeError, ValueError):
                 schema = {}
-    properties = schema.get("properties", {})
+    return schema.get("properties", {}) if isinstance(schema, dict) else {}
 
+
+def validate_operator_filters(custom_filters, benefit_plan):
+    properties = None
     for condition in custom_filters:
         if not isinstance(condition, str) or "=" not in condition:
             raise ValidationError("Malformed enrolment operator filter.")
@@ -122,14 +125,13 @@ def validate_operator_filters(custom_filters, benefit_plan):
         if field == DISTRICT_FIELD:
             if benefit_plan.type != "GROUP":
                 raise ValidationError("District enrollment filtering is only supported for households.")
-            # A registry fallback schema must never enable a phase-only operator.
-            phase_schema = benefit_plan.beneficiary_data_schema or {}
-            if isinstance(phase_schema, str):
-                phase_schema = json.loads(phase_schema)
-            if field not in phase_schema.get("properties", {}):
-                raise ValidationError("District enrollment filter is not allowed by this phase.")
+            if EnrolmentConfig.enable_household_district_filter is not True:
+                raise ValidationError("Household district filtering is disabled.")
             district_from_condition(condition)
+            continue
 
+        if properties is None:
+            properties = _operator_filter_properties(benefit_plan)
         definition = properties.get(field)
         if not isinstance(definition, dict):
             raise ValidationError(

@@ -4,6 +4,7 @@ from unittest.mock import patch
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 
+from enrolment.apps import EnrolmentConfig, DEFAULT_CONFIG
 from enrolment.district import district_from_condition
 from enrolment.criteria import validate_operator_filters as _validate_operator_filters
 
@@ -16,6 +17,11 @@ from social_protection.tests.test_helpers import create_benefit_plan
 
 
 class DistrictFilterContractTest(SimpleTestCase):
+    def setUp(self):
+        flag = patch.object(EnrolmentConfig, "enable_household_district_filter", True)
+        flag.start()
+        self.addCleanup(flag.stop)
+
     def test_unrelated_filter_is_not_interpreted_as_location(self):
         self.assertIsNone(district_from_condition('district__exact__string="A"'))
 
@@ -40,22 +46,43 @@ class DistrictFilterContractTest(SimpleTestCase):
         with self.assertRaisesMessage(ValidationError, "active District"):
             district_from_condition("district_id__exact__integer=123")
 
-    def test_schema_and_group_type_are_required(self):
+    def test_reserved_filter_ignores_schema_but_requires_group_and_flag(self):
         condition = "district_id__exact__integer=123"
-        plan = SimpleNamespace(type="GROUP", beneficiary_data_schema={
-            "properties": {"validation_status": {"type": "string"}}
-        })
-        with self.assertRaisesMessage(ValidationError, "not allowed"):
-            _validate_operator_filters([condition], plan)
+        for schema in ({}, {"properties": {"district_id": {"type": "string"}}}, "{invalid"):
+            plan = SimpleNamespace(type="GROUP", beneficiary_data_schema=schema)
+            with patch("enrolment.criteria.district_from_condition") as validate:
+                _validate_operator_filters([condition], plan)
+                validate.assert_called_once_with(condition)
+            with patch.object(EnrolmentConfig, "enable_household_district_filter", False):
+                with self.assertRaisesMessage(ValidationError, "disabled"):
+                    _validate_operator_filters([condition], plan)
         plan.type = "INDIVIDUAL"
-        plan.beneficiary_data_schema["properties"]["district_id"] = {"type": "integer"}
         with self.assertRaisesMessage(ValidationError, "only supported for households"):
             _validate_operator_filters([condition], plan)
+
+    def test_flag_defaults_false_and_requires_boolean(self):
+        self.assertIs(DEFAULT_CONFIG["enable_household_district_filter"], False)
+        for value in (True, False):
+            EnrolmentConfig._validate_config({**DEFAULT_CONFIG, "enable_household_district_filter": value})
+        for value in (None, 0, 1, "true", "false", []):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                EnrolmentConfig._validate_config({**DEFAULT_CONFIG, "enable_household_district_filter": value})
+
+    def test_ordinary_json_filter_validation_is_unchanged(self):
+        plan = SimpleNamespace(type="GROUP", beneficiary_data_schema={"properties": {"score": {"type": "integer"}}})
+        with patch.object(EnrolmentConfig, "enable_household_district_filter", False):
+            _validate_operator_filters(["score__gte__integer=1"], plan)
+            for condition in ("unknown__exact__integer=1", "score__exact__string=1"):
+                with self.assertRaises(ValidationError):
+                    _validate_operator_filters([condition], plan)
 
 
 @override_settings(ROW_SECURITY=True)
 class DistrictEnrollmentQueryTest(TestCase):
     def setUp(self):
+        flag = patch.object(EnrolmentConfig, "enable_household_district_filter", True)
+        flag.start()
+        self.addCleanup(flag.stop)
         cache.clear()
         create_test_language(code="en")
         self.admin = LogInHelper().get_or_create_user_api()
@@ -80,7 +107,7 @@ class DistrictEnrollmentQueryTest(TestCase):
         self.plan = create_benefit_plan(self.admin.username, payload_override={
             "type": "GROUP",
             "beneficiary_data_schema": {"properties": {
-                "district_id": {"type": "integer"}, "validation_status": {"type": "string"}
+                "validation_status": {"type": "string"}
             }},
             "json_ext": {"advanced_criteria": {"ACTIVE": [{
                 "field": "validation_status", "filter": "exact", "type": "string", "value": "VERIFIED"
@@ -302,3 +329,19 @@ class DistrictEnrollmentQueryTest(TestCase):
             task.refresh_from_db()
             self.assertEqual(task.status, Task.Status.FAILED)
             self.assertFalse(GroupBeneficiary.objects.filter(benefit_plan=self.plan).exists())
+
+    def test_disabled_flag_rejects_direct_summary_and_confirmation(self):
+        from enrolment.services import EnrolmentService, build_group_enrolment_summary
+        with patch.object(EnrolmentConfig, "enable_household_district_filter", False):
+            for call in (
+                lambda: self.query(self.a),
+                lambda: build_group_enrolment_summary(self.conditions(self.a), str(self.plan.id), "ACTIVE", self.user),
+                lambda: EnrolmentService(self.user).select_groups_to_benefit_plan(self.conditions(self.a), str(self.plan.id), "ACTIVE", self.user),
+            ):
+                with self.assertRaisesMessage(ValidationError, "disabled"):
+                    call()
+            self.assertTrue(self.query().filter(pk=self.selected.pk).exists())
+            self.plan.json_ext['advanced_criteria']['ACTIVE'].append({"custom_filter_condition": self.conditions(self.a)[0]})
+            self.plan.save(username=self.admin.username)
+            with self.assertRaisesMessage(ValidationError, "disabled"):
+                self.query()

@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     "mandatory_enrollment_criteria": {"INDIVIDUAL": {}, "GROUP": {}},
     "enable_maker_checker_logic_enrollment": True,
+    "enable_household_district_filter": False,
     "validation_enrollment": "validation-enrollment",
     "validation_group_enrollment": "validation-group-enrollment",
     "default_beneficiary_status": "POTENTIAL",
@@ -30,6 +31,7 @@ class EnrolmentConfig(AppConfig):
 
     mandatory_enrollment_criteria = None
     enable_maker_checker_logic_enrollment = None
+    enable_household_district_filter = False
     validation_enrollment = None
     validation_group_enrollment = None
     default_beneficiary_status = None
@@ -51,7 +53,7 @@ class EnrolmentConfig(AppConfig):
 
     @classmethod
     def _load_config(cls, config):
-        for field, value in config.items():
+        for field, value in {**DEFAULT_CONFIG, **config}.items():
             if hasattr(cls, field):
                 setattr(cls, field, value)
 
@@ -76,6 +78,8 @@ class EnrolmentConfig(AppConfig):
                 errors.append(f"{field} must be a non-empty string.")
         if not isinstance(config.get("enable_maker_checker_logic_enrollment"), bool):
             errors.append("enable_maker_checker_logic_enrollment must be boolean.")
+        if not isinstance(config.get("enable_household_district_filter", False), bool):
+            errors.append("enable_household_district_filter must be boolean.")
         batch_size = config.get("bulk_enrollment_batch_size")
         if type(batch_size) is not int or batch_size < 1:
             errors.append("bulk_enrollment_batch_size must be a positive integer.")
