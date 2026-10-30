@@ -1,7 +1,6 @@
 from django.db.models import Exists, OuterRef
 
 from core.signals import register_service_signal
-from individual.models import Group, Individual
 from social_protection.models import Beneficiary, GroupBeneficiary
 
 from enrolment.candidate_sources import GROUP_SOURCE, INDIVIDUAL_SOURCE
