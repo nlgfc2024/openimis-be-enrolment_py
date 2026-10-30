@@ -27,13 +27,22 @@ def load_enrolment_phase(benefit_plan_id, status, expected_type=None):
     if "social_protection" not in apps.app_configs:
         raise ValidationError("The Social Protection module is required for enrolment.")
 
-    from social_protection.models import BenefitPlan, BeneficiaryStatus
+    from social_protection.models import BenefitPlan
 
     benefit_plan = BenefitPlan.objects.filter(
         id=benefit_plan_id,
         is_deleted=False,
     ).first()
     if not benefit_plan:
+        raise ValidationError("The selected BenefitPlan does not exist.")
+    _validate_enrolment_phase(benefit_plan, benefit_plan_id, status, expected_type)
+    return benefit_plan
+
+
+def _validate_enrolment_phase(benefit_plan, benefit_plan_id, status, expected_type):
+    from social_protection.models import BeneficiaryStatus
+
+    if benefit_plan.is_deleted or str(benefit_plan.pk) != str(benefit_plan_id):
         raise ValidationError("The selected BenefitPlan does not exist.")
     if expected_type and benefit_plan.type != expected_type:
         raise ValidationError(
@@ -42,17 +51,19 @@ def load_enrolment_phase(benefit_plan_id, status, expected_type=None):
         )
     if status not in BeneficiaryStatus.values:
         raise ValidationError(f"Unsupported beneficiary status: {status}.")
-    return benefit_plan
 
 
-def merge_enrolment_criteria(custom_filters, benefit_plan_id, status, expected_type=None):
+def merge_enrolment_criteria(
+    custom_filters, benefit_plan_id, status, expected_type=None, *, benefit_plan=None,
+):
     """Return immutable, Phase, and operator criteria as one AND-ed list."""
     operator_filters = list(custom_filters or [])
-    benefit_plan = load_enrolment_phase(
-        benefit_plan_id,
-        status,
-        expected_type,
-    )
+    if benefit_plan is None:
+        benefit_plan = load_enrolment_phase(benefit_plan_id, status, expected_type)
+    else:
+        # Confirmation supplies a locked Phase; reuse it without bypassing the
+        # type/status checks previously performed by the second database load.
+        _validate_enrolment_phase(benefit_plan, benefit_plan_id, status, expected_type)
     validate_operator_filters(operator_filters, benefit_plan)
 
     configured = EnrolmentConfig.mandatory_enrollment_criteria or {}

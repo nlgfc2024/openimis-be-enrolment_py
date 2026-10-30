@@ -47,6 +47,3 @@ records merely to configure the frontend.
 
 No Phase schema or Social Protection creation-default edits are required.
 `district_id` is a location relationship filter, not beneficiary JSON data.
-The former schema-preparation command has been removed. If its proposed schema
-additions were previously applied, review and remove only those additions through
-supported administration paths, preserving real data fields and eligibility rules.

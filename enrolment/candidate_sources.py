@@ -1,4 +1,4 @@
-from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import PermissionDenied
 from django.db.models import Count, Exists, OuterRef
 
 from core.custom_filters import CustomFilterWizardStorage
@@ -16,10 +16,15 @@ class IndividualCandidateSource:
     phase_type = "INDIVIDUAL"
 
     def authorized_queryset(self, user=None):
+        if user is None or user.is_anonymous:
+            raise PermissionDenied("An authenticated user is required for individual enrollment.")
         queryset = Individual.objects.filter(is_deleted=False)
-        return Individual.get_queryset(queryset, user or AnonymousUser()).distinct()
+        return Individual.get_queryset(queryset, user).distinct()
 
-    def eligible_queryset(self, custom_filters, benefit_plan_id, status, user=None):
+    def eligible_queryset(
+        self, custom_filters, benefit_plan_id, status, user=None, *,
+        benefit_plan=None, selection_context=None,
+    ):
         # Row security must be applied before criteria, ranking, counting, or
         # pagination so no later operation can widen the authorized population.
         query = self.authorized_queryset(user)
@@ -28,6 +33,7 @@ class IndividualCandidateSource:
             benefit_plan_id,
             status,
             self.phase_type,
+            benefit_plan=benefit_plan,
         )
         active_membership = active_household_memberships().filter(
             individual_id=OuterRef("pk")
@@ -50,8 +56,12 @@ class GroupCandidateSource:
         queryset = Group.objects.filter(is_deleted=False)
         return scoped_groups(queryset, user).distinct()
 
-    def eligible_queryset(self, custom_filters, benefit_plan_id, status, user=None):
-        query = self.authorized_queryset(user).annotate(
+    def eligible_queryset(
+        self, custom_filters, benefit_plan_id, status, user=None, *,
+        benefit_plan=None, selection_context=None,
+    ):
+        authorized = self.authorized_queryset(user)
+        query = authorized.annotate(
             _authoritative_primary_workers=Count(
                 "groupindividuals",
                 filter=primary_worker_membership_filter(),
@@ -62,8 +72,24 @@ class GroupCandidateSource:
             benefit_plan_id,
             status,
             self.phase_type,
+            benefit_plan=benefit_plan,
         )
-        query, filters = apply_district_filters(query, filters, user)
+        district_scopes = {}
+        query, filters = apply_district_filters(
+            query, filters, user, district_scopes=district_scopes,
+        )
+        if selection_context is not None:
+            # Existing enrolments ignore eligibility criteria, but retain row
+            # security and the operator's already validated district scope.
+            enrolled_scope = authorized
+            for condition in custom_filters or []:
+                if condition in district_scopes:
+                    enrolled_scope = enrolled_scope.filter(
+                        location_id__in=district_scopes[condition]
+                    )
+            selection_context.update(
+                authorized_groups=authorized, enrolled_groups=enrolled_scope,
+            )
         return CustomFilterWizardStorage.build_custom_filters_queryset(
             "individual",
             "Group",

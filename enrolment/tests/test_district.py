@@ -264,6 +264,24 @@ class DistrictEnrollmentQueryTest(TestCase):
                 'enrolledHouseholds': 0,
             })
 
+    def test_summary_reuses_selection_phase_and_district_scope(self):
+        from enrolment import criteria, district
+        from enrolment.candidate_sources import GROUP_SOURCE
+
+        with (
+            patch("enrolment.services.load_enrolment_phase", wraps=criteria.load_enrolment_phase) as load,
+            patch("enrolment.criteria.load_enrolment_phase", wraps=criteria.load_enrolment_phase) as reload,
+            patch("enrolment.district.check_district_access", wraps=district.check_district_access) as access,
+            patch.object(GROUP_SOURCE, "authorized_queryset", wraps=GROUP_SOURCE.authorized_queryset) as scope,
+            patch("enrolment.candidate_sources.apply_district_filters", wraps=district.apply_district_filters) as apply,
+        ):
+            self.assertEqual(self.summary(self.a)['verifiedUnenrolledHouseholds'], 1)
+        load.assert_called_once()
+        reload.assert_not_called()
+        access.assert_called_once()
+        scope.assert_called_once()
+        apply.assert_called_once()
+
     def test_existing_enrollments_ignore_eligibility_but_respect_scope_and_status(self):
         from social_protection.models import GroupBeneficiary
         for group, status, deleted in (

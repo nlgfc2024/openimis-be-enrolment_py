@@ -68,7 +68,7 @@ def check_district_access(district, user):
         raise PermissionDenied("The selected district is outside your permitted locations.")
 
 
-def apply_district_filters(query, filters, user):
+def apply_district_filters(query, filters, user, *, district_scopes=None):
     """Consume reserved relationship filters before the registry JSON wizard."""
     remaining = []
     for condition in filters:
@@ -77,5 +77,8 @@ def apply_district_filters(query, filters, user):
             remaining.append(condition)
         else:
             check_district_access(district, user)
-            query = query.filter(location_id__in=district_location_ids(district))
+            location_ids = district_location_ids(district)
+            if district_scopes is not None:
+                district_scopes[condition] = location_ids
+            query = query.filter(location_id__in=location_ids)
     return query, remaining
