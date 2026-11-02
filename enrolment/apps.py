@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 
 from django.apps import AppConfig
 from django.core.exceptions import ValidationError
@@ -22,6 +23,7 @@ DEFAULT_CONFIG = {
     "registry_household_verification_field": "validation_status",
     "registry_verified_household_value": "VERIFIED",
     "bulk_enrollment_batch_size": 1000,
+    "max_enrolment_score": 100,
 }
 
 
@@ -40,6 +42,7 @@ class EnrolmentConfig(AppConfig):
     registry_household_verification_field = None
     registry_verified_household_value = None
     bulk_enrollment_batch_size = None
+    max_enrolment_score = None
 
     def ready(self):
         from core.models import ModuleConfiguration
@@ -83,6 +86,14 @@ class EnrolmentConfig(AppConfig):
         batch_size = config.get("bulk_enrollment_batch_size")
         if type(batch_size) is not int or batch_size < 1:
             errors.append("bulk_enrollment_batch_size must be a positive integer.")
+        max_score = config.get("max_enrolment_score", DEFAULT_CONFIG["max_enrolment_score"])
+        if (
+            isinstance(max_score, bool)
+            or not isinstance(max_score, (int, float))
+            or not math.isfinite(max_score)
+            or max_score <= 0
+        ):
+            errors.append("max_enrolment_score must be a positive number.")
         if errors:
             raise ValidationError({"config": errors})
 

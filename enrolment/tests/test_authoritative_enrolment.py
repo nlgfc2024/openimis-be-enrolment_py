@@ -172,6 +172,79 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         self.assertIsNone(percentage)
         self.assertTrue(respect_max)
 
+    def _ranking_with_points(self, *points, normalise_to=100):
+        return {
+            "weighted_score": {
+                "normalise_to": normalise_to,
+                "components": [
+                    {
+                        "field": f"item_{index}",
+                        "weight": item_points,
+                        "scoring": {
+                            "type": "numeric_bands",
+                            "bands": [{"min": 0, "points": item_points}],
+                        },
+                    }
+                    for index, item_points in enumerate(points)
+                ],
+            },
+            "order_by": [{"field": "_weighted_score", "direction": "desc"}],
+        }
+
+    def test_weighted_ranking_rejects_points_above_maximum_score(self):
+        with self.assertRaisesMessage(
+            ValidationError,
+            "components add up to 102 points, more than the maximum "
+            "enrolment score of 100",
+        ):
+            validate_ranking_spec(self._ranking_with_points(60, 42), Individual)
+
+    def test_weighted_ranking_accepts_points_equal_to_maximum_score(self):
+        order_items, _, _ = validate_ranking_spec(
+            self._ranking_with_points(60, 40),
+            Individual,
+        )
+
+        self.assertEqual(order_items[0]["field"], "_weighted_score")
+
+    def test_weighted_ranking_counts_declared_maximum_points(self):
+        ranking = self._ranking_with_points(60, 30)
+        ranking["weighted_score"]["components"][1]["scoring"]["maximum_points"] = 50
+
+        with self.assertRaisesMessage(ValidationError, "add up to 110 points"):
+            validate_ranking_spec(ranking, Individual)
+
+    def test_weighted_ranking_rejects_normalise_to_above_maximum_score(self):
+        with self.assertRaisesMessage(
+            ValidationError,
+            "normalise_to cannot exceed 100, the maximum enrolment score",
+        ):
+            validate_ranking_spec(
+                self._ranking_with_points(60, 40, normalise_to=150),
+                Individual,
+            )
+
+    @patch.object(EnrolmentConfig, "max_enrolment_score", 65)
+    def test_weighted_ranking_uses_configured_maximum_score(self):
+        with self.assertRaisesMessage(ValidationError, "maximum enrolment score of 65"):
+            validate_ranking_spec(
+                self._ranking_with_points(40, 30, normalise_to=65),
+                Individual,
+            )
+
+    def test_module_config_rejects_invalid_maximum_score(self):
+        from enrolment.apps import DEFAULT_CONFIG
+
+        for value in (0, -1, True, "100", float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesMessage(
+                    ValidationError,
+                    "max_enrolment_score must be a positive number.",
+                ):
+                    EnrolmentConfig._validate_config(
+                        {**DEFAULT_CONFIG, "max_enrolment_score": value}
+                    )
+
     def test_weighted_ranking_validation_requires_score_in_ordering(self):
         with self.assertRaisesMessage(ValidationError, "must include _weighted_score"):
             validate_ranking_spec({
