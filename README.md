@@ -30,3 +30,20 @@ ranking configuration retains the legacy behaviour and does not apply
 Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
 against current registry and beneficiary data in the same transaction.
+
+## Optional household district filter
+
+Set `enable_household_district_filter: true` in the backend `enrolment`
+ModuleConfiguration to enable the reserved `district_id__exact__integer=<R ID>`
+operator. The default is false. Only GROUP enrolment supports it; backend
+validation rejects district conditions when disabled even if sent directly by API
+clients or included in saved criteria. Active District (R), location permissions,
+primary-worker eligibility and approval-time revalidation still apply.
+
+Set the same boolean in the exposed frontend `fe-enrolment` module configuration
+to offer the picker. The frontend setting controls presentation only; it cannot
+enable an operator disabled by the backend. Do not expose backend configuration
+records merely to configure the frontend.
+
+No Phase schema or Social Protection creation-default edits are required.
+`district_id` is a location relationship filter, not beneficiary JSON data.
