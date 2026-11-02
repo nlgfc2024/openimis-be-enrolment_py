@@ -6,6 +6,7 @@ from social_protection.models import Beneficiary, GroupBeneficiary
 from enrolment.candidate_sources import GROUP_SOURCE, INDIVIDUAL_SOURCE
 from enrolment.criteria import load_enrolment_phase
 from enrolment.ranking import rank_and_cap_queryset
+from enrolment.apps import EnrolmentConfig
 
 
 def build_individual_enrolment_queryset(
@@ -39,8 +40,10 @@ def _build_selection(
     benefit_plan = benefit_plan or load_enrolment_phase(
         benefit_plan_id, status, source.phase_type
     )
+    context = {}
     eligible = source.eligible_queryset(
-        custom_filters, benefit_plan_id, status, user
+        custom_filters, benefit_plan_id, status, user,
+        benefit_plan=benefit_plan, selection_context=context,
     )
     if candidate_ids is not None:
         eligible = eligible.filter(id__in=candidate_ids)
@@ -68,7 +71,7 @@ def _build_selection(
         materialize_selected_ids=materialize_selected_ids,
         apply_percentage_limit=apply_percentage_limit,
     )
-    return benefit_plan, eligible, assigned, selected, metadata
+    return benefit_plan, eligible, assigned, selected, metadata, context
 
 
 def build_individual_enrolment_selection(
@@ -81,7 +84,7 @@ def build_individual_enrolment_selection(
     benefit_plan=None,
     apply_percentage_limit=True,
 ):
-    _, eligible, assigned, selected, metadata = _build_selection(
+    _, eligible, assigned, selected, metadata, _ = _build_selection(
         source=INDIVIDUAL_SOURCE,
         assignment_model=Beneficiary,
         assignment_field="individual",
@@ -115,7 +118,7 @@ def build_group_enrolment_selection(
     benefit_plan=None,
     apply_percentage_limit=True,
 ):
-    _, eligible, assigned, selected, metadata = _build_selection(
+    plan, eligible, assigned, selected, metadata, context = _build_selection(
         source=GROUP_SOURCE,
         assignment_model=GroupBeneficiary,
         assignment_field="group",
@@ -132,6 +135,8 @@ def build_group_enrolment_selection(
         "groups_assigned_to_selected_programme": assigned,
         "groups_not_assigned_to_selected_programme": selected,
         "group_query_with_filters": eligible,
+        "benefit_plan": plan,
+        **context,
         "benefit_plan_id": benefit_plan_id,
         "status": status,
         "user": user,
@@ -200,9 +205,20 @@ def build_group_enrolment_summary(
     )
     selected_count = query.count()
     not_assigned_count = query.filter(_assigned_to_any_plan=False).count()
+    enrolled_count = selection["enrolled_groups"].annotate(
+        _enrolled=Exists(active_selected_assignment),
+    ).filter(_enrolled=True).distinct().count()
+    verified_pool = query.filter(
+        _assigned_to_selected_plan=False,
+        **{f"json_ext__{EnrolmentConfig.registry_household_verification_field}":
+           EnrolmentConfig.registry_verified_household_value},
+    ).count()
     return {
+        "verified_unenrolled_households": verified_pool,
+        "phase_target": selection["benefit_plan"].max_beneficiaries,
+        "enrolled_households": enrolled_count,
         "number_of_selected_groups": selected_count,
-        "total_number_of_groups": GROUP_SOURCE.authorized_queryset(user).count(),
+        "total_number_of_groups": selection["authorized_groups"].count(),
         "number_of_groups_not_assigned_to_programme": not_assigned_count,
         "number_of_groups_assigned_to_programme": selected_count - not_assigned_count,
         "number_of_groups_assigned_to_selected_programme": query.filter(

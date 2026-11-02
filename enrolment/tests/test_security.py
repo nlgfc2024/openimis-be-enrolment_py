@@ -1,6 +1,12 @@
 import copy
+from types import SimpleNamespace
 
-from django.test import override_settings
+from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.test import SimpleTestCase, override_settings
+
+from enrolment.candidate_sources import GROUP_SOURCE, INDIVIDUAL_SOURCE
+from enrolment.criteria import merge_enrolment_criteria
 
 from enrolment.services import (
     EnrolmentService,
@@ -18,6 +24,31 @@ from individual.tests.test_helpers import (
     add_individual_to_group,
 )
 from social_protection.tests.test_helpers import create_benefit_plan
+
+
+class CandidateAuthenticationTest(SimpleTestCase):
+    def test_reused_phase_still_validates_identity_deletion_type_and_status(self):
+        for changes, plan_id, status in (
+            ({}, "another-plan", "ACTIVE"),
+            ({"is_deleted": True}, "plan", "ACTIVE"),
+            ({"type": "INDIVIDUAL"}, "plan", "ACTIVE"),
+            ({}, "plan", "INVALID"),
+        ):
+            phase = SimpleNamespace(**{"pk": "plan", "type": "GROUP", "is_deleted": False, **changes})
+            with self.subTest(changes=changes, plan_id=plan_id, status=status):
+                with self.assertRaises(ValidationError):
+                    merge_enrolment_criteria([], plan_id, status, "GROUP", benefit_plan=phase)
+
+    def test_both_sources_reject_missing_and_anonymous_users_before_querying(self):
+        for row_security in (True, False):
+            for source in (INDIVIDUAL_SOURCE, GROUP_SOURCE):
+                for user in (None, AnonymousUser()):
+                    with self.subTest(source=source.phase_type, user=user, row_security=row_security):
+                        with override_settings(ROW_SECURITY=row_security):
+                            with self.assertRaisesMessage(PermissionDenied, "authenticated user"):
+                                source.authorized_queryset(user)
+                            with self.assertRaisesMessage(PermissionDenied, "authenticated user"):
+                                source.eligible_queryset([], "unused-plan", "ACTIVE", user)
 
 
 @override_settings(ROW_SECURITY=True)
