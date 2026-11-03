@@ -254,10 +254,17 @@ def _validate_weighted_score(weighted_score):
             "Unsupported enrolment_ranking.weighted_score keys: "
             + ", ".join(sorted(unexpected))
         )
+    normalise_to = weighted_score.get("normalise_to", 100)
     _positive_number(
-        weighted_score.get("normalise_to", 100),
+        normalise_to,
         "enrolment_ranking.weighted_score.normalise_to",
     )
+    max_score = EnrolmentConfig.max_enrolment_score
+    if normalise_to > max_score:
+        raise ValidationError(
+            "enrolment_ranking.weighted_score.normalise_to cannot exceed "
+            f"{max_score:g}, the maximum enrolment score."
+        )
     components = weighted_score.get("components")
     if not isinstance(components, list) or not components:
         raise ValidationError(
@@ -282,6 +289,15 @@ def _validate_weighted_score(weighted_score):
         fields.add(field)
         _positive_number(component.get("weight"), f"{path}.weight")
         _validate_scoring(component.get("scoring"), f"{path}.scoring")
+    total_points = sum(
+        _maximum_points(component["scoring"]) for component in components
+    )
+    if total_points > max_score:
+        raise ValidationError(
+            "enrolment_ranking.weighted_score components add up to "
+            f"{total_points:g} points, more than the maximum enrolment score "
+            f"of {max_score:g}."
+        )
 
 
 def _normalise_selection_strategy(selection_strategy, model):

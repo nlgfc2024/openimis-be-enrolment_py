@@ -16,6 +16,9 @@ The module accepts the following `MODULE_CONFIGURATION` keys:
   `registry_verified_household_value`: registry field mappings used by ranking
   and group eligibility.
 - `bulk_enrollment_batch_size`: persistence batch size.
+- `max_enrolment_score`: highest score a weighted ranking may award (default
+  `100`). A ranking is rejected if its components' maximum points add up to
+  more than this, or if its `weighted_score.normalise_to` is above it.
 
 The individual and group maker-checker validation event names can be overridden
 with `validation_enrollment` and `validation_group_enrollment`.
