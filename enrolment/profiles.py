@@ -5,11 +5,17 @@ Profiles live in the ``programme_profiles`` module configuration, keyed by
 fallback. A Phase that matches no profile keeps its own criteria only.
 """
 from django.core.exceptions import ValidationError
+from django.db.models import Exists, OuterRef
 
 from core.custom_filters import CustomFilterWizardStorage
 
 from enrolment.apps import EnrolmentConfig
 from enrolment.criteria import FILTERS_BY_TYPE, criterion_to_condition
+from enrolment.membership import (
+    active_household_memberships,
+    authoritative_primary_worker_memberships,
+    household_head_memberships,
+)
 
 
 DEFAULT_PROFILE = "default"
@@ -18,7 +24,13 @@ ELIGIBILITY_KEYS = {"criteria"}
 CRITERION_KEYS = {"subject", "field", "filter", "type", "value"}
 # Subjects that name the candidate record itself, by Phase type.
 CANDIDATE_SUBJECTS = {"GROUP": "household", "INDIVIDUAL": "self"}
-SUBJECTS = set(CANDIDATE_SUBJECTS.values())
+# Household members a GROUP criterion may read, by subject.
+MEMBER_SUBJECTS = {
+    "primary_worker": authoritative_primary_worker_memberships,
+    "head": household_head_memberships,
+    "any_member": active_household_memberships,
+}
+SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
 # Value types the individual module's custom filter wizards can cast.
 VALUE_TYPES = {
     "string": lambda value: isinstance(value, str),
@@ -116,21 +128,48 @@ def apply_profile_eligibility(queryset, benefit_plan, phase_type):
     key, profile = resolve_programme_profile(benefit_plan)
     if profile is None:
         return queryset
-    criteria = (profile.get("eligibility") or {}).get("criteria") or []
-    conditions = []
-    for criterion in criteria:
-        subject = criterion.get("subject", CANDIDATE_SUBJECTS[phase_type])
-        if subject != CANDIDATE_SUBJECTS[phase_type]:
+    eligibility = profile.get("eligibility") or {}
+    candidate_subject = CANDIDATE_SUBJECTS[phase_type]
+    conditions_by_subject = {}
+    for criterion in eligibility.get("criteria") or []:
+        subject = criterion.get("subject", candidate_subject)
+        if subject != candidate_subject and (
+            phase_type != "GROUP" or subject not in MEMBER_SUBJECTS
+        ):
             raise ValidationError(
                 f"Programme profile {key} uses subject {subject}, which "
                 f"{phase_type} Phases do not support."
             )
-        conditions.append(criterion_to_condition(criterion))
-    if conditions:
+        conditions_by_subject.setdefault(subject, []).append(
+            criterion_to_condition(criterion)
+        )
+
+    candidate_conditions = conditions_by_subject.pop(candidate_subject, [])
+    if candidate_conditions:
         queryset = CustomFilterWizardStorage.build_custom_filters_queryset(
             "individual",
             "Group" if phase_type == "GROUP" else "Individual",
-            conditions,
+            candidate_conditions,
             queryset,
         )
+    for subject, conditions in conditions_by_subject.items():
+        queryset = queryset.filter(_member_matches(subject, conditions))
     return queryset
+
+
+def _member_matches(subject, conditions):
+    """Require one household member of ``subject`` to meet every condition."""
+    from individual.models import Individual
+
+    matching = CustomFilterWizardStorage.build_custom_filters_queryset(
+        "individual",
+        "Individual",
+        conditions,
+        Individual.objects.filter(is_deleted=False),
+    )
+    return Exists(
+        MEMBER_SUBJECTS[subject]().filter(
+            group_id=OuterRef("pk"),
+            individual_id__in=matching.values("id"),
+        )
+    )

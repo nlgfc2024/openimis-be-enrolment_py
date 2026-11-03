@@ -31,6 +31,9 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
                 "description": "Rural Micro Enterprise Programme",
                 "eligibility": {"criteria": [_criterion(subject="household")]},
             },
+            "UPG": {"eligibility": {"criteria": [
+                _criterion(subject=subject) for subject in ("primary_worker", "head", "any_member")
+            ]}},
             "default": {"eligibility": {"criteria": [_criterion()]}},
         }), [])
 
@@ -127,6 +130,35 @@ class ProgrammeProfileEligibilityTest(SimpleTestCase):
         sql = str(self._apply([_criterion()], Individual, "INDIVIDUAL").query)
         self.assertIn("validation_status", sql)
 
+    def test_member_criteria_require_a_matching_household_member(self):
+        for subject, marker in (
+            ("primary_worker", "primary_worker"),
+            ("head", "HEAD"),
+            ("any_member", "individual_groupindividual"),
+        ):
+            with self.subTest(subject=subject):
+                sql = str(self._apply(
+                    [_criterion(subject=subject, field="business_experience", value="Yes")],
+                    Group,
+                    "GROUP",
+                ).query)
+                self.assertIn("EXISTS", sql)
+                self.assertIn("business_experience", sql)
+                self.assertIn(marker, sql)
+
+    def test_criteria_with_the_same_member_subject_share_one_member(self):
+        same = str(self._apply([
+            _criterion(subject="any_member", field="savings", value="Yes"),
+            _criterion(subject="any_member", field="willing", value="Yes"),
+        ], Group, "GROUP").query)
+        separate = str(self._apply([
+            _criterion(subject="any_member", field="savings", value="Yes"),
+            _criterion(subject="head", field="willing", value="Yes"),
+        ], Group, "GROUP").query)
+
+        self.assertEqual(same.count("EXISTS"), 1)
+        self.assertEqual(separate.count("EXISTS"), 2)
+
     def test_subject_must_suit_the_phase_type(self):
         with self.assertRaisesMessage(
             ValidationError, "uses subject self, which GROUP Phases"
@@ -136,3 +168,9 @@ class ProgrammeProfileEligibilityTest(SimpleTestCase):
             ValidationError, "uses subject household, which INDIVIDUAL Phases"
         ):
             self._apply([_criterion(subject="household")], Individual, "INDIVIDUAL")
+        with self.assertRaisesMessage(
+            ValidationError, "uses subject primary_worker, which INDIVIDUAL Phases"
+        ):
+            self._apply(
+                [_criterion(subject="primary_worker")], Individual, "INDIVIDUAL"
+            )
