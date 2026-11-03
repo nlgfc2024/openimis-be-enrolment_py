@@ -23,7 +23,7 @@ from django.db.models.functions import Cast
 
 from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
-from enrolment.criteria import criterion_to_condition
+from enrolment.criteria import FILTERS_BY_TYPE, criterion_to_condition
 from enrolment.membership import authoritative_primary_worker_memberships
 
 
@@ -39,6 +39,25 @@ WEIGHTED_SCORE_FIELD = "_weighted_score"
 PRIMARY_WORKER_SOURCE = "PRIMARY_WORKER"
 HOUSEHOLD_HEAD_SOURCE = "HOUSEHOLD_HEAD"
 SELF_SOURCE = "SELF"
+SOURCE_SUBJECTS = {
+    SELF_SOURCE: "self",
+    PRIMARY_WORKER_SOURCE: "primary_worker",
+    HOUSEHOLD_HEAD_SOURCE: "head",
+}
+SHORTHAND_QUOTA_KEYS = {
+    "female_percentage",
+    "youth_percentage",
+    "female_value",
+    "youth_min_age",
+    "youth_max_age",
+}
+# Value types the Individual custom filter wizard can cast for quota conditions.
+QUOTA_VALUE_TYPES = {
+    "string": lambda value: isinstance(value, str),
+    "integer": lambda value: type(value) is int,
+    "numeric": lambda value: _is_number(value),
+    "boolean": lambda value: isinstance(value, bool),
+}
 
 
 def load_ranking_spec(benefit_plan, status):
@@ -308,14 +327,7 @@ def _normalise_selection_strategy(selection_strategy, model):
         raise ValidationError(
             "enrolment_ranking.selection_strategy must be an object."
         )
-    allowed = {
-        "source",
-        "female_percentage",
-        "youth_percentage",
-        "female_value",
-        "youth_min_age",
-        "youth_max_age",
-    }
+    allowed = {"source", "quotas", "fill_remaining", *SHORTHAND_QUOTA_KEYS}
     unexpected = set(selection_strategy) - allowed
     if unexpected:
         raise ValidationError(
@@ -335,6 +347,32 @@ def _normalise_selection_strategy(selection_strategy, model):
             "HOUSEHOLD_HEAD."
         )
 
+    fill_remaining = selection_strategy.get("fill_remaining", True)
+    if not isinstance(fill_remaining, bool):
+        raise ValidationError(
+            "enrolment_ranking.selection_strategy.fill_remaining must be boolean."
+        )
+
+    if "quotas" in selection_strategy:
+        shorthand = SHORTHAND_QUOTA_KEYS & set(selection_strategy)
+        if shorthand:
+            raise ValidationError(
+                "enrolment_ranking.selection_strategy.quotas cannot be combined "
+                "with " + ", ".join(sorted(shorthand)) + "."
+            )
+        quotas = _normalise_quotas(selection_strategy["quotas"], source)
+    else:
+        quotas = _shorthand_quotas(selection_strategy)
+
+    return {
+        "source": source,
+        "quotas": quotas,
+        "fill_remaining": fill_remaining,
+    }
+
+
+def _shorthand_quotas(selection_strategy):
+    """Translate the female/youth shorthand into female then youth buckets."""
     female = selection_strategy.get("female_percentage", 0)
     youth = selection_strategy.get("youth_percentage", 0)
     for key, value in (
@@ -378,29 +416,152 @@ def _normalise_selection_strategy(selection_strategy, model):
             "with 0 <= minimum <= maximum <= 120."
         )
 
+    return [
+        {
+            "key": "female",
+            "percentage": female,
+            "when": [{
+                "field": EnrolmentConfig.registry_gender_field,
+                "filter": "iexact",
+                "type": "string",
+                "value": female_value,
+            }],
+        },
+        {
+            "key": "youth",
+            "percentage": youth,
+            "when": [
+                {"derived": "age", "filter": "gte", "value": youth_min},
+                {"derived": "age", "filter": "lte", "value": youth_max},
+            ],
+        },
+    ]
+
+
+def _normalise_quotas(quotas, source):
+    path = "enrolment_ranking.selection_strategy.quotas"
+    if not isinstance(quotas, list) or not quotas:
+        raise ValidationError(f"{path} must be a non-empty list.")
+
+    normalised = []
+    keys = set()
+    total_percentage = 0
+    for index, quota in enumerate(quotas):
+        quota_path = f"{path}[{index}]"
+        if not isinstance(quota, dict):
+            raise ValidationError(f"{quota_path} must be an object.")
+        unexpected = set(quota) - {"key", "when", "percentage", "count"}
+        if unexpected:
+            raise ValidationError(
+                f"Unsupported {quota_path} keys: " + ", ".join(sorted(unexpected))
+            )
+
+        key = quota.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError(f"{quota_path}.key must be a non-empty string.")
+        if key in keys:
+            raise ValidationError(f"{path} key {key} is used more than once.")
+        keys.add(key)
+
+        if ("percentage" in quota) == ("count" in quota):
+            raise ValidationError(
+                f"{quota_path} must set exactly one of percentage or count."
+            )
+        bucket = {"key": key}
+        if "percentage" in quota:
+            percentage = quota["percentage"]
+            if not _is_number(percentage) or not 0 < percentage <= 100:
+                raise ValidationError(
+                    f"{quota_path}.percentage must be above 0 and at most 100."
+                )
+            total_percentage += percentage
+            bucket["percentage"] = percentage
+        else:
+            count = quota["count"]
+            if type(count) is not int or count < 1:
+                raise ValidationError(
+                    f"{quota_path}.count must be a positive integer."
+                )
+            bucket["count"] = count
+
+        conditions = quota.get("when")
+        if not isinstance(conditions, list) or not conditions:
+            raise ValidationError(f"{quota_path}.when must be a non-empty list.")
+        bucket["when"] = [
+            _normalise_quota_condition(
+                condition, f"{quota_path}.when[{condition_index}]", source
+            )
+            for condition_index, condition in enumerate(conditions)
+        ]
+        normalised.append(bucket)
+
+    if total_percentage > 100:
+        raise ValidationError(f"{path} percentages cannot exceed 100.")
+    return normalised
+
+
+def _normalise_quota_condition(condition, path, source):
+    if not isinstance(condition, dict):
+        raise ValidationError(f"{path} must be an object.")
+    unexpected = set(condition) - {
+        "subject", "field", "derived", "filter", "type", "value",
+    }
+    if unexpected:
+        raise ValidationError(
+            f"Unsupported {path} keys: " + ", ".join(sorted(unexpected))
+        )
+
+    subject = condition.get("subject")
+    expected_subject = SOURCE_SUBJECTS[source]
+    if subject is not None and subject != expected_subject:
+        raise ValidationError(
+            f"{path}.subject must be {expected_subject} when the "
+            f"selection_strategy.source is {source}."
+        )
+    if ("field" in condition) == ("derived" in condition):
+        raise ValidationError(f"{path} must set exactly one of field or derived.")
+
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    if "derived" in condition:
+        if condition["derived"] != "age":
+            raise ValidationError(
+                f"{path}.derived {condition['derived']} is not supported; "
+                "only age is."
+            )
+        if condition.get("type", "integer") != "integer":
+            raise ValidationError(f"{path}.type must be integer for age.")
+        if filter_name not in FILTERS_BY_TYPE["integer"]:
+            raise ValidationError(f"{path}.filter {filter_name} is not allowed for age.")
+        if type(value) is not int or not 0 <= value <= 120:
+            raise ValidationError(f"{path}.value must be an age from 0 to 120.")
+        return {"derived": "age", "filter": filter_name, "value": value}
+
+    field = condition["field"]
+    if (
+        not isinstance(field, str)
+        or not field.strip()
+        or "__" in field
+        or "=" in field
+    ):
+        raise ValidationError(f"{path}.field must be a json_ext key.")
+    value_type = condition.get("type")
+    if value_type not in QUOTA_VALUE_TYPES:
+        raise ValidationError(
+            f"{path}.type must be one of "
+            + ", ".join(sorted(QUOTA_VALUE_TYPES)) + "."
+        )
+    if filter_name not in FILTERS_BY_TYPE[value_type]:
+        raise ValidationError(
+            f"{path}.filter {filter_name} is not allowed for {value_type}."
+        )
+    if not QUOTA_VALUE_TYPES[value_type](value):
+        raise ValidationError(f"{path}.value must be a {value_type}.")
     return {
-        "source": source,
-        "quotas": [
-            {
-                "key": "female",
-                "percentage": female,
-                "when": [{
-                    "field": EnrolmentConfig.registry_gender_field,
-                    "filter": "iexact",
-                    "type": "string",
-                    "value": female_value,
-                }],
-            },
-            {
-                "key": "youth",
-                "percentage": youth,
-                "when": [
-                    {"derived": "age", "filter": "gte", "value": youth_min},
-                    {"derived": "age", "filter": "lte", "value": youth_max},
-                ],
-            },
-        ],
-        "fill_remaining": True,
+        "field": field,
+        "filter": filter_name,
+        "type": value_type,
+        "value": value,
     }
 
 
@@ -722,10 +883,10 @@ def _select_quota_ids(ranked, selection_strategy, cap):
     selected_ids = []
 
     for quota in strategy["quotas"]:
-        target = min(
-            math.floor(cap * quota["percentage"] / 100),
-            cap - len(selected_ids),
-        )
+        target = quota.get("count")
+        if target is None:
+            target = math.floor(cap * quota["percentage"] / 100)
+        target = min(target, cap - len(selected_ids))
         if target <= 0:
             continue
         selected_ids.extend(

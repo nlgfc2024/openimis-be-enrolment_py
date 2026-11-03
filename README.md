@@ -45,6 +45,46 @@ list for female and youth candidates (`female_percentage`, `youth_percentage`).
   `HOUSEHOLD_HEAD` (the member with role `HEAD`, for female- or youth-headed
   household quotas).
 
+For other quotas, replace the female/youth keys with an ordered `quotas` list:
+
+```json
+"selection_strategy": {
+  "source": "SELF",
+  "quotas": [
+    {
+      "key": "zomba",
+      "count": 87,
+      "when": [
+        {"field": "city", "filter": "iexact", "type": "string", "value": "Zomba"}
+      ]
+    },
+    {
+      "key": "older",
+      "percentage": 10,
+      "when": [{"derived": "age", "filter": "gte", "value": 60}]
+    }
+  ],
+  "fill_remaining": false
+}
+```
+
+- Each bucket has a unique `key`, exactly one of `percentage` (of the cap,
+  rounded down) or `count`, and a non-empty `when` list. Percentages may add up
+  to at most 100.
+- `when` conditions all apply to the `source` person. A condition is either a
+  `json_ext` `field` with `filter`, `type` (`string`, `integer`, `numeric` or
+  `boolean`) and `value`, or `derived: age` with an integer `filter` and
+  `value`. An optional `subject` must name the source (`self`,
+  `primary_worker` or `head`).
+- Buckets fill in order from the ranked list, and nobody takes more than one
+  place. A bucket short of candidates leaves its places empty.
+- `fill_remaining` (default `true`) gives unfilled places to the next ranked
+  candidates. Set it to `false` to keep them empty.
+- `quotas` cannot be combined with `female_percentage`, `youth_percentage`,
+  `female_value`, `youth_min_age` or `youth_max_age`. That shorthand is
+  equivalent to a `female` bucket followed by a `youth` bucket, with
+  `fill_remaining: true`.
+
 ## Optional household district filter
 
 Set `enable_household_district_filter: true` in the backend `enrolment`
