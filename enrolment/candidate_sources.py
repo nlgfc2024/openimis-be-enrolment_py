@@ -2,9 +2,10 @@ from django.core.exceptions import PermissionDenied
 from django.db.models import Count, Exists, OuterRef
 
 from core.custom_filters import CustomFilterWizardStorage
+from individual.data_source import benefit_plan_data_source, data_source_q
 from individual.models import Group, Individual
 
-from enrolment.criteria import merge_enrolment_criteria
+from enrolment.criteria import load_enrolment_phase, merge_enrolment_criteria
 from enrolment.district import apply_district_filters, scoped_groups
 from enrolment.membership import (
     active_household_memberships,
@@ -28,6 +29,8 @@ class IndividualCandidateSource:
         # Row security must be applied before criteria, ranking, counting, or
         # pagination so no later operation can widen the authorized population.
         query = self.authorized_queryset(user)
+        benefit_plan = benefit_plan or load_enrolment_phase(benefit_plan_id, status, self.phase_type)
+        query = query.filter(data_source_q(benefit_plan_data_source(benefit_plan)))
         filters = merge_enrolment_criteria(
             custom_filters,
             benefit_plan_id,
@@ -61,7 +64,8 @@ class GroupCandidateSource:
         benefit_plan=None, selection_context=None,
     ):
         authorized = self.authorized_queryset(user)
-        query = authorized.annotate(
+        benefit_plan = benefit_plan or load_enrolment_phase(benefit_plan_id, status, self.phase_type)
+        query = authorized.filter(data_source_q(benefit_plan_data_source(benefit_plan))).annotate(
             _authoritative_primary_workers=Count(
                 "groupindividuals",
                 filter=primary_worker_membership_filter(),
