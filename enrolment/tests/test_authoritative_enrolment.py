@@ -570,6 +570,78 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         self.assertIn("NULLS LAST", sql)
         self.assertIn("integer", sql)
 
+    def test_group_ordering_reads_household_head_json_ext(self):
+        order_items, _, _ = validate_ranking_spec({
+            "order_by": [{
+                "subject": "head",
+                "field": "household_pmt_score",
+                "cast": "float",
+                "nulls": "last",
+            }],
+        }, Group, {"properties": {"other": {"type": "string"}}})
+
+        self.assertEqual(order_items[0]["subject"], "head")
+        self.assertEqual(order_items[0]["direction"], "asc")
+        sql = str(build_order_by(Group.objects.all(), order_items).query)
+        self.assertIn("household_pmt_score", sql)
+        self.assertIn("HEAD", sql)
+        self.assertIn("double precision", sql)
+        self.assertIn("NULLS LAST", sql)
+
+    def test_group_ordering_reads_primary_worker_json_ext(self):
+        order_items, _, _ = validate_ranking_spec({
+            "order_by": [{
+                "subject": "primary_worker",
+                "field": "business_period",
+                "direction": "desc",
+            }],
+        }, Group)
+
+        sql = str(build_order_by(Group.objects.all(), order_items).query)
+        self.assertIn("business_period", sql)
+        self.assertIn("primary_worker", sql)
+
+    def test_member_ordering_subjects_are_validated(self):
+        cases = [
+            (
+                {"subject": "head", "field": "household_pmt_score"},
+                Individual,
+                "subject must be self",
+            ),
+            (
+                {"subject": "self", "field": "household_pmt_score"},
+                Group,
+                "subject must be head or primary_worker",
+            ),
+            (
+                {"subject": "head", "field": "json_ext__household_pmt_score"},
+                Group,
+                "must be a json_ext key on the head",
+            ),
+        ]
+        for item, model, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    validate_ranking_spec({"order_by": [item]}, model)
+
+        order_items, _, _ = validate_ranking_spec({
+            "order_by": [{"subject": "self", "field": "dob"}],
+        }, Individual)
+        self.assertNotIn("subject", order_items[0])
+
+    def test_member_ordering_does_not_satisfy_weighted_score_ordering(self):
+        with self.assertRaisesMessage(ValidationError, "must include _weighted_score"):
+            validate_ranking_spec({
+                "weighted_score": {
+                    "components": [{
+                        "field": "business_period",
+                        "weight": 1,
+                        "scoring": {"type": "mapping", "values": {"Yes": 1}},
+                    }],
+                },
+                "order_by": [{"subject": "head", "field": "_weighted_score"}],
+            }, Group)
+
     def test_ranking_rejects_multi_valued_relation_paths(self):
         with self.assertRaisesMessage(ValidationError, "multi-valued path"):
             validate_ranking_spec(
@@ -1526,6 +1598,54 @@ class AuthoritativeEnrollmentTest(TestCase):
             ),
             {young_head.id, female_head.id},
         )
+
+    def test_group_ranking_orders_by_household_head_pmt_score(self):
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "GROUP",
+            "max_beneficiaries": 3,
+            "beneficiary_data_schema": {"properties": {}},
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
+                "enrolment_ranking": {
+                    "ACTIVE": {
+                        "order_by": [{
+                            "subject": "head",
+                            "field": "household_pmt_score",
+                            "cast": "float",
+                            "direction": "asc",
+                            "nulls": "last",
+                        }],
+                    }
+                },
+            },
+        })
+
+        def household(pmt_score):
+            json_ext = {}
+            if pmt_score is not None:
+                json_ext["household_pmt_score"] = pmt_score
+            return self._verified_group(individual_json_ext=json_ext)
+
+        household(None)
+        richer = household("40.5")
+        poorest = household("8.25")
+        poorer = household("12")
+        household("55")
+
+        selection = build_group_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        # Lowest PMT first; a household without a score sorts last and loses
+        # its place to scored households.
+        self.assertEqual(
+            list(
+                selection["groups_not_assigned_to_selected_programme"]
+                .values_list("id", flat=True)
+            ),
+            [poorest.id, poorer.id, richer.id],
+        )
+        self.assertEqual(selection["pool_size"], 5)
 
     def test_configured_count_quotas_leave_shortfall_unfilled(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={

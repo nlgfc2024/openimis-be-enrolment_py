@@ -44,6 +44,11 @@ SOURCE_SUBJECTS = {
     PRIMARY_WORKER_SOURCE: "primary_worker",
     HOUSEHOLD_HEAD_SOURCE: "head",
 }
+# Household members whose json_ext a GROUP order_by item may read.
+MEMBER_SUBJECT_SOURCES = {
+    SOURCE_SUBJECTS[HOUSEHOLD_HEAD_SOURCE]: HOUSEHOLD_HEAD_SOURCE,
+    SOURCE_SUBJECTS[PRIMARY_WORKER_SOURCE]: PRIMARY_WORKER_SOURCE,
+}
 SHORTHAND_QUOTA_KEYS = {
     "female_percentage",
     "youth_percentage",
@@ -116,7 +121,9 @@ def _normalise_order_item(
         field = item[1:] if item.startswith("-") else item
         result = {"field": field, "direction": direction}
     elif isinstance(item, dict):
-        unexpected = set(item) - {"field", "direction", "cast", "nulls"}
+        unexpected = set(item) - {
+            "subject", "field", "direction", "cast", "nulls",
+        }
         if unexpected:
             raise ValidationError(
                 f"Unsupported enrolment_ranking.order_by[{index}] keys: "
@@ -127,12 +134,37 @@ def _normalise_order_item(
     else:
         raise ValidationError(f"enrolment_ranking.order_by[{index}] must be a string or object.")
 
-    _validate_model_path(
-        model,
-        result.get("field"),
-        extra_fields,
-        schema_fields,
-    )
+    subject = result.pop("subject", None)
+    if model._meta.model_name == "individual":
+        if subject not in {None, SOURCE_SUBJECTS[SELF_SOURCE]}:
+            raise ValidationError(
+                f"INDIVIDUAL enrolment_ranking.order_by[{index}].subject "
+                "must be self."
+            )
+        subject = None
+    elif subject is not None and subject not in MEMBER_SUBJECT_SOURCES:
+        raise ValidationError(
+            f"GROUP enrolment_ranking.order_by[{index}].subject must be "
+            "head or primary_worker."
+        )
+
+    if subject is None:
+        _validate_model_path(
+            model,
+            result.get("field"),
+            extra_fields,
+            schema_fields,
+        )
+    else:
+        # Member values come from Individual.json_ext, which the Phase's
+        # beneficiary_data_schema does not describe.
+        field = result.get("field")
+        if not isinstance(field, str) or not field or "__" in field:
+            raise ValidationError(
+                f"enrolment_ranking.order_by[{index}].field must be a json_ext "
+                f"key on the {subject}."
+            )
+        result["subject"] = subject
     if result["direction"] not in SUPPORTED_DIRECTIONS:
         raise ValidationError(f"Unsupported ranking direction: {result['direction']}.")
     if result.get("cast") not in ({None} | set(SUPPORTED_CASTS)):
@@ -613,7 +645,8 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         for index, item in enumerate(order_by)
     ]
     if weighted_score is not None and not any(
-        item["field"] == WEIGHTED_SCORE_FIELD for item in normalised
+        item["field"] == WEIGHTED_SCORE_FIELD and not item.get("subject")
+        for item in normalised
     ):
         raise ValidationError(
             "enrolment_ranking.order_by must include _weighted_score when "
@@ -622,7 +655,10 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
 
     tie_breaker = ranking.get("tie_breaker", "id")
     _validate_model_path(model, tie_breaker, schema_fields=schema_fields)
-    normalised = [item for item in normalised if item["field"] != tie_breaker]
+    normalised = [
+        item for item in normalised
+        if item.get("subject") or item["field"] != tie_breaker
+    ]
     normalised.append({"field": tie_breaker, "direction": "asc"})
 
     limit = ranking.get("limit", {})
@@ -800,6 +836,23 @@ def _age_range_dob(today, minimum_age, maximum_age):
     return earliest, latest
 
 
+def _household_member(source):
+    """Return the outer household's head or primary-worker membership."""
+    from individual.models import GroupIndividual
+
+    if source == HOUSEHOLD_HEAD_SOURCE:
+        return GroupIndividual.objects.filter(
+            group_id=OuterRef("pk"),
+            is_deleted=False,
+            group__is_deleted=False,
+            individual__is_deleted=False,
+            role=GroupIndividual.Role.HEAD,
+        ).order_by("id")
+    return authoritative_primary_worker_memberships().filter(
+        group_id=OuterRef("pk")
+    ).order_by("id")
+
+
 def _annotate_selection_source(queryset, source):
     """Annotate the person whose attributes place a candidate in a quota."""
     if source == SELF_SOURCE:
@@ -808,21 +861,7 @@ def _annotate_selection_source(queryset, source):
             _selection_dob=F("dob"),
         )
 
-    from individual.models import GroupIndividual
-
-    if source == HOUSEHOLD_HEAD_SOURCE:
-        member = GroupIndividual.objects.filter(
-            group_id=OuterRef("pk"),
-            is_deleted=False,
-            group__is_deleted=False,
-            individual__is_deleted=False,
-            role=GroupIndividual.Role.HEAD,
-        ).order_by("id")
-    else:
-        member = authoritative_primary_worker_memberships().filter(
-            group_id=OuterRef("pk")
-        ).order_by("id")
-
+    member = _household_member(source)
     return queryset.annotate(
         _selection_individual=Subquery(member.values("individual_id")[:1]),
         _selection_dob=Subquery(
@@ -928,7 +967,14 @@ def build_order_by(queryset, order_items):
         alias = f"_enrolment_rank_{index}"
         field_name = item["field"]
         expression = F(field_name)
-        if field_name.startswith("json_ext__"):
+        if item.get("subject"):
+            member = _household_member(MEMBER_SUBJECT_SOURCES[item["subject"]])
+            value = KeyTextTransform(field_name, "individual__json_ext")
+            expression = Subquery(
+                member.annotate(_order_value=value).values("_order_value")[:1],
+                output_field=CharField(),
+            )
+        elif field_name.startswith("json_ext__"):
             expression = KeyTextTransform.from_lookup(field_name)
         elif field_name != WEIGHTED_SCORE_FIELD:
             try:
@@ -954,9 +1000,15 @@ def build_order_by(queryset, order_items):
     return queryset.annotate(**annotations).order_by(*ordering)
 
 
+def _order_item_label(item):
+    if item.get("subject"):
+        return f"{item['subject']}.{item['field']}"
+    return item["field"]
+
+
 def _cast_error(order_items, exc, weighted_score=None):
     casts = ", ".join(
-        f"{item['field']} ({item['cast']})"
+        f"{_order_item_label(item)} ({item['cast']})"
         for item in order_items
         if item.get("cast")
     )
