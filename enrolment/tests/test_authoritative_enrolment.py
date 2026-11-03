@@ -19,6 +19,8 @@ from enrolment.services import (
 from enrolment.ranking import (
     HOUSEHOLD_HEAD_SOURCE,
     _annotate_selection_source,
+    _normalise_selection_strategy,
+    _quota_q,
     calculate_cap,
     build_order_by,
     build_weighted_score,
@@ -346,16 +348,43 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
     def test_household_quota_source_compiles_gender_and_dob_to_sql(self):
         from individual.models import Group
 
+        strategy = _normalise_selection_strategy({
+            "source": HOUSEHOLD_HEAD_SOURCE,
+            "female_percentage": 40,
+            "youth_percentage": 40,
+        }, Group)
         candidates = _annotate_selection_source(
             Group.objects.all(),
             HOUSEHOLD_HEAD_SOURCE,
         )
+        for quota in strategy["quotas"]:
+            candidates = candidates.filter(_quota_q(quota["when"]))
 
         sql = str(candidates.query)
         self.assertIn("individual_individual", sql)
         self.assertIn("gender", sql)
         self.assertIn("dob", sql.lower())
         self.assertIn("HEAD", sql)
+
+    def test_shorthand_quotas_become_female_then_youth_buckets(self):
+        strategy = _normalise_selection_strategy({
+            "source": "SELF",
+            "female_percentage": 60,
+            "youth_percentage": 40,
+            "youth_min_age": 18,
+            "youth_max_age": 35,
+        }, Individual)
+
+        self.assertEqual(
+            [(quota["key"], quota["percentage"]) for quota in strategy["quotas"]],
+            [("female", 60), ("youth", 40)],
+        )
+        self.assertEqual(strategy["quotas"][0]["when"][0]["value"], "Female")
+        self.assertEqual(
+            [(c["filter"], c["value"]) for c in strategy["quotas"][1]["when"]],
+            [("gte", 18), ("lte", 35)],
+        )
+        self.assertTrue(strategy["fill_remaining"])
 
     def test_string_json_ext_snapshot_uses_status_then_wildcard(self):
         plan = Mock(json_ext='{"enrolment_ranking":{"*":{"order_by":["id"]},"ACTIVE":{"order_by":["-id"]}}}')
