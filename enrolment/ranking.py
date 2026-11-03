@@ -13,6 +13,7 @@ from django.db.models import (
     FloatField,
     IntegerField,
     OuterRef,
+    Q,
     Subquery,
     Value,
     When,
@@ -20,7 +21,9 @@ from django.db.models import (
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast
 
+from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
+from enrolment.criteria import criterion_to_condition
 from enrolment.membership import authoritative_primary_worker_memberships
 
 
@@ -377,11 +380,27 @@ def _normalise_selection_strategy(selection_strategy, model):
 
     return {
         "source": source,
-        "female_percentage": female,
-        "youth_percentage": youth,
-        "female_value": female_value,
-        "youth_min_age": youth_min,
-        "youth_max_age": youth_max,
+        "quotas": [
+            {
+                "key": "female",
+                "percentage": female,
+                "when": [{
+                    "field": EnrolmentConfig.registry_gender_field,
+                    "filter": "iexact",
+                    "type": "string",
+                    "value": female_value,
+                }],
+            },
+            {
+                "key": "youth",
+                "percentage": youth,
+                "when": [
+                    {"derived": "age", "filter": "gte", "value": youth_min},
+                    {"derived": "age", "filter": "lte", "value": youth_max},
+                ],
+            },
+        ],
+        "fill_remaining": True,
     }
 
 
@@ -621,12 +640,10 @@ def _age_range_dob(today, minimum_age, maximum_age):
 
 
 def _annotate_selection_source(queryset, source):
+    """Annotate the person whose attributes place a candidate in a quota."""
     if source == SELF_SOURCE:
         return queryset.annotate(
-            _selection_gender=KeyTextTransform(
-                EnrolmentConfig.registry_gender_field,
-                "json_ext",
-            ),
+            _selection_individual=F("id"),
             _selection_dob=F("dob"),
         )
 
@@ -645,15 +662,8 @@ def _annotate_selection_source(queryset, source):
             group_id=OuterRef("pk")
         ).order_by("id")
 
-    gender = KeyTextTransform(
-        EnrolmentConfig.registry_gender_field,
-        "individual__json_ext",
-    )
     return queryset.annotate(
-        _selection_gender=Subquery(
-            member.annotate(_value=gender).values("_value")[:1],
-            output_field=CharField(),
-        ),
+        _selection_individual=Subquery(member.values("individual_id")[:1]),
         _selection_dob=Subquery(
             member.values("individual__dob")[:1],
             output_field=DateField(),
@@ -661,11 +671,47 @@ def _annotate_selection_source(queryset, source):
     )
 
 
+def _age_condition_q(filter_name, age):
+    """Translate an age comparison into a date-of-birth range on the source."""
+    today = date.today()
+    if filter_name == "gt":
+        filter_name, age = "gte", age + 1
+    elif filter_name == "lt":
+        filter_name, age = "lte", age - 1
+    if filter_name == "gte":
+        return Q(_selection_dob__lte=_years_ago_boundary(today, age))
+    if filter_name == "lte":
+        return Q(_selection_dob__gte=_age_range_dob(today, 0, age)[0])
+    return Q(_selection_dob__range=_age_range_dob(today, age, age))
+
+
+def _quota_q(conditions):
+    """Combine a quota's conditions on the selection source into one filter."""
+    from individual.models import Individual
+
+    query = Q()
+    field_conditions = []
+    for condition in conditions:
+        if condition.get("derived") == "age":
+            query &= _age_condition_q(condition["filter"], condition["value"])
+        else:
+            field_conditions.append(criterion_to_condition(condition))
+    if field_conditions:
+        matching = CustomFilterWizardStorage.build_custom_filters_queryset(
+            "individual",
+            "Individual",
+            field_conditions,
+            Individual.objects.filter(is_deleted=False),
+        )
+        query &= Q(_selection_individual__in=matching.values("id"))
+    return query
+
+
 def _select_quota_ids(ranked, selection_strategy, cap):
-    """Select female, then non-overlapping youth quotas, then ranked fallback.
+    """Fill quota buckets in order, then optionally the ranked fallback.
 
     ``ranked`` already carries the configured weighted/deterministic ordering.
-    Each quota and the fallback retain that ordering, and exclusions ensure one
+    Each bucket and the fallback retain that ordering, and exclusions ensure one
     beneficiary cannot occupy more than one place.
     """
     strategy = _normalise_selection_strategy(
@@ -675,33 +721,21 @@ def _select_quota_ids(ranked, selection_strategy, cap):
     candidates = _annotate_selection_source(ranked, strategy["source"])
     selected_ids = []
 
-    female_target = math.floor(
-        cap * strategy["female_percentage"] / 100
-    )
-    if female_target:
-        selected_ids.extend(
-            candidates.filter(
-                _selection_gender__iexact=strategy["female_value"]
-            ).values_list("id", flat=True)[:female_target]
+    for quota in strategy["quotas"]:
+        target = min(
+            math.floor(cap * quota["percentage"] / 100),
+            cap - len(selected_ids),
         )
-
-    youth_target = math.floor(
-        cap * strategy["youth_percentage"] / 100
-    )
-    if youth_target:
-        earliest, latest = _age_range_dob(
-            date.today(),
-            strategy["youth_min_age"],
-            strategy["youth_max_age"],
-        )
+        if target <= 0:
+            continue
         selected_ids.extend(
             candidates.exclude(id__in=selected_ids).filter(
-                _selection_dob__range=(earliest, latest)
-            ).values_list("id", flat=True)[:youth_target]
+                _quota_q(quota["when"])
+            ).values_list("id", flat=True)[:target]
         )
 
     remaining = cap - len(selected_ids)
-    if remaining:
+    if remaining and strategy["fill_remaining"]:
         selected_ids.extend(
             candidates.exclude(id__in=selected_ids).values_list(
                 "id", flat=True
