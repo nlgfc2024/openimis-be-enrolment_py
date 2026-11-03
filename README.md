@@ -26,7 +26,19 @@ with `validation_enrollment` and `validation_group_enrollment`.
 ## Ranking and confirmation
 
 Ranking paths may reference a concrete model field or a scalar `json_ext` key.
-Related and other multi-valued paths are rejected. A benefit plan without a
+Related and other multi-valued paths are rejected.
+
+GROUP Phases can also order households by a member's value. Add `subject` to
+an `order_by` object: `head` (the member with role `HEAD`) or `primary_worker`
+(the verified primary worker). `field` is then a key in that member's
+`json_ext`, for example to rank households by the PMT score stored on the head:
+
+```json
+{"subject": "head", "field": "household_pmt_score", "cast": "float", "direction": "asc", "nulls": "last"}
+```
+
+INDIVIDUAL Phases accept only `subject: self`, which is the same as leaving it
+out. A benefit plan without a
 ranking configuration retains the legacy behaviour and does not apply
 `max_beneficiaries` as a selection cap.
 
