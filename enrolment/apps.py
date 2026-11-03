@@ -24,6 +24,8 @@ DEFAULT_CONFIG = {
     "registry_verified_household_value": "VERIFIED",
     "bulk_enrollment_batch_size": 1000,
     "max_enrolment_score": 100,
+    # Eligibility rules shared by a programme's Phases, keyed by BenefitPlan code.
+    "programme_profiles": {},
 }
 
 
@@ -43,6 +45,7 @@ class EnrolmentConfig(AppConfig):
     registry_verified_household_value = None
     bulk_enrollment_batch_size = None
     max_enrolment_score = None
+    programme_profiles = None
 
     def ready(self):
         from core.models import ModuleConfiguration
@@ -63,6 +66,7 @@ class EnrolmentConfig(AppConfig):
     @classmethod
     def _validate_config(cls, config):
         from enrolment.criteria import validate_mandatory_enrolment_criteria
+        from enrolment.profiles import validate_programme_profiles
 
         validate_mandatory_enrolment_criteria(
             config.get("mandatory_enrollment_criteria", {})
@@ -94,6 +98,9 @@ class EnrolmentConfig(AppConfig):
             or max_score <= 0
         ):
             errors.append("max_enrolment_score must be a positive number.")
+        errors.extend(validate_programme_profiles(
+            config.get("programme_profiles", DEFAULT_CONFIG["programme_profiles"])
+        ))
         if errors:
             raise ValidationError({"config": errors})
 
