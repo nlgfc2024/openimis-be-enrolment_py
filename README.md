@@ -34,6 +34,17 @@ Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
 against current registry and beneficiary data in the same transaction.
 
+## Selection quotas
+
+`enrolment_ranking[status].selection_strategy` reserves places in the ranked
+list for female and youth candidates (`female_percentage`, `youth_percentage`).
+`source` names the person whose gender and date of birth are checked:
+
+- INDIVIDUAL Phases: `SELF`.
+- GROUP Phases: `PRIMARY_WORKER` (the household's verified primary worker) or
+  `HOUSEHOLD_HEAD` (the member with role `HEAD`, for female- or youth-headed
+  household quotas).
+
 ## Optional household district filter
 
 Set `enable_household_district_filter: true` in the backend `enrolment`
