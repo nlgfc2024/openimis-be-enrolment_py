@@ -326,9 +326,10 @@ def _normalise_selection_strategy(selection_strategy, model):
             raise ValidationError(
                 "INDIVIDUAL selection_strategy.source must be SELF."
             )
-    elif source != PRIMARY_WORKER_SOURCE:
+    elif source not in {PRIMARY_WORKER_SOURCE, HOUSEHOLD_HEAD_SOURCE}:
         raise ValidationError(
-            "GROUP selection_strategy.source must be PRIMARY_WORKER."
+            "GROUP selection_strategy.source must be PRIMARY_WORKER or "
+            "HOUSEHOLD_HEAD."
         )
 
     female = selection_strategy.get("female_percentage", 0)

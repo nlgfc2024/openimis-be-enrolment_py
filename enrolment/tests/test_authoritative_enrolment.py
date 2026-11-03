@@ -26,7 +26,7 @@ from enrolment.ranking import (
     rank_and_cap_queryset,
     validate_ranking_spec,
 )
-from individual.models import Group, Individual
+from individual.models import Group, GroupIndividual, Individual
 from enrolment.schema import Query
 from individual.custom_filters import GroupCustomFilterWizard, IndividualCustomFilterWizard
 from individual.tests.test_helpers import (
@@ -294,6 +294,27 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                     "youth_percentage": 50,
                 },
             }, Individual)
+
+    def test_group_selection_strategy_accepts_primary_worker_or_head(self):
+        for source in ("PRIMARY_WORKER", HOUSEHOLD_HEAD_SOURCE):
+            validate_ranking_spec({
+                "selection_strategy": {
+                    "source": source,
+                    "female_percentage": 40,
+                    "youth_percentage": 40,
+                },
+            }, Group)
+
+        with self.assertRaisesMessage(
+            ValidationError,
+            "source must be PRIMARY_WORKER or HOUSEHOLD_HEAD",
+        ):
+            validate_ranking_spec({
+                "selection_strategy": {
+                    "source": "SELF",
+                    "female_percentage": 40,
+                },
+            }, Group)
 
     def test_primary_worker_weighted_score_compiles_to_sql(self):
         from individual.models import Group
@@ -1262,6 +1283,60 @@ class AuthoritativeEnrollmentTest(TestCase):
                 .values_list("id", flat=True)
             ),
             {young.id, female.id},
+        )
+
+    def test_group_quotas_can_use_household_head_gender_and_dob(self):
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "GROUP",
+            "max_beneficiaries": 2,
+            "beneficiary_data_schema": {"properties": {}},
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
+                "enrolment_ranking": {
+                    "ACTIVE": {
+                        "order_by": ["id"],
+                        "selection_strategy": {
+                            "source": "HOUSEHOLD_HEAD",
+                            "female_percentage": 50,
+                            "youth_percentage": 50,
+                        },
+                    }
+                }
+            },
+        })
+
+        def household(head_gender, head_age):
+            # The primary worker is always an older man, so only the head's
+            # gender and age can place the household in a quota.
+            group = self._verified_group(
+                individual_json_ext={"gender": "Male"},
+                dob=date(date.today().year - 50, 1, 1),
+            )
+            GroupIndividual.objects.filter(group=group).update(
+                role=GroupIndividual.Role.SON
+            )
+            head = create_individual(self.user.username, {
+                "dob": date(date.today().year - head_age, 1, 1),
+                "json_ext": {"gender": head_gender},
+            })
+            add_individual_to_group(self.user.username, head, group)
+            return group
+
+        household("Male", 50)
+        young_head = household("Male", 25)
+        female_head = household("Female", 45)
+
+        selection = build_group_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        self.assertEqual(selection["will_enrol"], 2)
+        self.assertEqual(
+            set(
+                selection["groups_not_assigned_to_selected_programme"]
+                .values_list("id", flat=True)
+            ),
+            {young_head.id, female_head.id},
         )
 
     def test_group_selection_only_excludes_active_assignment_for_requested_status(self):
