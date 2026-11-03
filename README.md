@@ -47,6 +47,11 @@ profile uses `default`; without a `default` it uses only its own criteria.
 ```
 
 - A profile may contain `description` and `eligibility`.
+- Profiles don't set a registry source. Enrolment already keeps only records
+  whose `json_ext.data_source` matches the Phase's own `json_ext.data_source`.
+  A Phase without one uses `ubr`, which also matches untagged records. On an
+  instance with several programmes, set it on each Phase (for example `pwp` for
+  RMEP and `sctp` for UPG).
 - The profile's criteria are combined with the Phase's `advanced_criteria`, the
   mandatory criteria and the operator's filters. A candidate must meet all of
   them.
