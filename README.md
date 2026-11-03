@@ -38,7 +38,8 @@ profile uses `default`; without a `default` it uses only its own criteria.
     "description": "Rural Micro Enterprise Programme",
     "eligibility": {
       "criteria": [
-        {"subject": "household", "field": "validation_status", "filter": "exact", "type": "string", "value": "VERIFIED"}
+        {"subject": "household", "field": "validation_status", "filter": "exact", "type": "string", "value": "VERIFIED"},
+        {"subject": "primary_worker", "field": "business_experience", "filter": "exact", "type": "string", "value": "Yes"}
       ]
     }
   }
@@ -51,8 +52,13 @@ profile uses `default`; without a `default` it uses only its own criteria.
   them.
 - A criterion is a `json_ext` `field` with `filter`, `type` (`string`,
   `integer`, `numeric` or `boolean`) and `value`. `subject` names the record it
-  reads: `household` on GROUP Phases or `self` on INDIVIDUAL Phases. Without a
-  `subject`, the criterion reads the candidate itself.
+  reads. Without a `subject`, the criterion reads the candidate itself.
+  - INDIVIDUAL Phases: `self`.
+  - GROUP Phases: `household`, or a member's `json_ext`: `primary_worker` (the
+    verified primary worker), `head` (the member with role `HEAD`) or
+    `any_member`.
+  - Criteria with the same member subject must all be met by one member. For
+    example, two `any_member` criteria need a single member who meets both.
 - Only top-level keys are merged with the module defaults, so supply the whole
   `programme_profiles` block when overriding it. The block is validated when
   the configuration is saved. A subject that doesn't suit the Phase type is
