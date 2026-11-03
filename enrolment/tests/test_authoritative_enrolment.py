@@ -386,6 +386,165 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         )
         self.assertTrue(strategy["fill_remaining"])
 
+    def _quota_strategy(self, quotas, source="SELF", **extra):
+        return {"source": source, "quotas": quotas, **extra}
+
+    def _business_quota(self, **overrides):
+        return {
+            "key": "business",
+            "percentage": 50,
+            "when": [{
+                "field": "business_type",
+                "filter": "exact",
+                "type": "string",
+                "value": "Retail",
+            }],
+            **overrides,
+        }
+
+    def test_configured_quotas_are_normalised_in_order(self):
+        strategy = _normalise_selection_strategy(self._quota_strategy([
+            self._business_quota(),
+            {
+                "key": "older",
+                "count": 10,
+                "when": [{
+                    "subject": "self",
+                    "derived": "age",
+                    "filter": "gte",
+                    "value": 60,
+                }],
+            },
+        ], fill_remaining=False), Individual)
+
+        self.assertEqual(
+            [quota["key"] for quota in strategy["quotas"]],
+            ["business", "older"],
+        )
+        self.assertEqual(strategy["quotas"][0]["percentage"], 50)
+        self.assertEqual(strategy["quotas"][1]["count"], 10)
+        self.assertEqual(
+            strategy["quotas"][1]["when"],
+            [{"derived": "age", "filter": "gte", "value": 60}],
+        )
+        self.assertFalse(strategy["fill_remaining"])
+
+    def test_configured_quotas_reject_invalid_buckets(self):
+        cases = [
+            (
+                self._quota_strategy([self._business_quota()], female_percentage=40),
+                "cannot be combined with female_percentage",
+            ),
+            (self._quota_strategy([]), "quotas must be a non-empty list"),
+            (
+                self._quota_strategy([
+                    self._business_quota(),
+                    self._business_quota(key="other", percentage=60),
+                ]),
+                "percentages cannot exceed 100",
+            ),
+            (
+                self._quota_strategy([
+                    self._business_quota(),
+                    self._business_quota(percentage=10),
+                ]),
+                "key business is used more than once",
+            ),
+            (
+                self._quota_strategy([self._business_quota(count=5)]),
+                "exactly one of percentage or count",
+            ),
+            (
+                self._quota_strategy([
+                    {"key": "business", "count": 0, "when": [{}]},
+                ]),
+                "count must be a positive integer",
+            ),
+            (
+                self._quota_strategy([self._business_quota(when=[])]),
+                "when must be a non-empty list",
+            ),
+            (
+                self._quota_strategy(
+                    [self._business_quota()], fill_remaining="no"
+                ),
+                "fill_remaining must be boolean",
+            ),
+        ]
+        for strategy, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    _normalise_selection_strategy(strategy, Individual)
+
+    def test_configured_quota_conditions_are_validated(self):
+        def with_condition(condition, source="SELF", model=Individual):
+            _normalise_selection_strategy(self._quota_strategy(
+                [self._business_quota(when=[condition])], source=source,
+            ), model)
+
+        cases = [
+            (
+                {"subject": "head", "field": "gender", "filter": "exact",
+                 "type": "string", "value": "Female"},
+                "subject must be self when the selection_strategy.source is SELF",
+            ),
+            (
+                {"derived": "district", "filter": "exact", "value": "Zomba"},
+                "derived district is not supported",
+            ),
+            (
+                {"field": "gender", "derived": "age", "filter": "gte", "value": 1},
+                "exactly one of field or derived",
+            ),
+            (
+                {"field": "gender__isnull", "filter": "exact",
+                 "type": "boolean", "value": True},
+                "field must be a json_ext key",
+            ),
+            (
+                {"field": "registered", "filter": "exact",
+                 "type": "date", "value": "2026-01-01"},
+                "type must be one of",
+            ),
+            (
+                {"field": "gender", "filter": "gte",
+                 "type": "string", "value": "Female"},
+                "filter gte is not allowed for string",
+            ),
+            (
+                {"field": "workers", "filter": "gte",
+                 "type": "integer", "value": "5"},
+                "value must be a integer",
+            ),
+            (
+                {"derived": "age", "filter": "gte", "value": 18.5},
+                "value must be an age from 0 to 120",
+            ),
+        ]
+        for condition, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    with_condition(condition)
+
+        with_condition(
+            {"subject": "head", "field": "gender", "filter": "iexact",
+             "type": "string", "value": "Female"},
+            source=HOUSEHOLD_HEAD_SOURCE,
+            model=Group,
+        )
+
+    def test_configured_quota_compiles_field_condition_on_primary_worker(self):
+        strategy = _normalise_selection_strategy(self._quota_strategy(
+            [self._business_quota()], source="PRIMARY_WORKER",
+        ), Group)
+        candidates = _annotate_selection_source(
+            Group.objects.all(), "PRIMARY_WORKER",
+        ).filter(_quota_q(strategy["quotas"][0]["when"]))
+
+        sql = str(candidates.query)
+        self.assertIn("business_type", sql)
+        self.assertIn("primary_worker", sql)
+
     def test_string_json_ext_snapshot_uses_status_then_wildcard(self):
         plan = Mock(json_ext='{"enrolment_ranking":{"*":{"order_by":["id"]},"ACTIVE":{"order_by":["-id"]}}}')
         self.assertEqual(load_ranking_spec(plan, "ACTIVE")["order_by"], ["-id"])
@@ -1366,6 +1525,66 @@ class AuthoritativeEnrollmentTest(TestCase):
                 .values_list("id", flat=True)
             ),
             {young_head.id, female_head.id},
+        )
+
+    def test_configured_count_quotas_leave_shortfall_unfilled(self):
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "INDIVIDUAL",
+            "max_beneficiaries": 4,
+            "beneficiary_data_schema": {
+                "properties": {"quota_scope": {"type": "string"}}
+            },
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": [{
+                    "field": "quota_scope",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "city-quotas",
+                }]},
+                "enrolment_ranking": {
+                    "ACTIVE": {
+                        "order_by": ["id"],
+                        "selection_strategy": {
+                            "source": "SELF",
+                            "quotas": [
+                                {
+                                    "key": city.lower(),
+                                    "count": 2,
+                                    "when": [{
+                                        "field": "city",
+                                        "filter": "exact",
+                                        "type": "string",
+                                        "value": city,
+                                    }],
+                                }
+                                for city in ("Zomba", "Mzuzu")
+                            ],
+                            "fill_remaining": False,
+                        },
+                    }
+                },
+            },
+        })
+
+        def applicant(city):
+            return create_individual(self.user.username, {
+                "json_ext": {"quota_scope": "city-quotas", "city": city},
+            })
+
+        zomba = [applicant("Zomba") for _ in range(3)]
+        mzuzu = applicant("Mzuzu")
+        applicant("Lilongwe")
+
+        selection = build_individual_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        # Mzuzu has one applicant for two places; the spare place stays empty
+        # rather than going to a third Zomba or a Lilongwe applicant.
+        self.assertEqual(selection["will_enrol"], 3)
+        self.assertEqual(
+            set(selection["selected_ids"]),
+            {zomba[0].id, zomba[1].id, mzuzu.id},
         )
 
     def test_group_selection_only_excludes_active_assignment_for_requested_status(self):
