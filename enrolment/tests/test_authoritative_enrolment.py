@@ -384,7 +384,6 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             [(c["filter"], c["value"]) for c in strategy["quotas"][1]["when"]],
             [("gte", 18), ("lte", 35)],
         )
-        self.assertTrue(strategy["fill_remaining"])
 
     def _quota_strategy(self, quotas, source="SELF", **extra):
         return {"source": source, "quotas": quotas, **extra}
@@ -415,7 +414,7 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                     "value": 60,
                 }],
             },
-        ], fill_remaining=False), Individual)
+        ]), Individual)
 
         self.assertEqual(
             [quota["key"] for quota in strategy["quotas"]],
@@ -427,7 +426,6 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             strategy["quotas"][1]["when"],
             [{"derived": "age", "filter": "gte", "value": 60}],
         )
-        self.assertFalse(strategy["fill_remaining"])
 
     def test_configured_quotas_reject_invalid_buckets(self):
         cases = [
@@ -466,9 +464,9 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             ),
             (
                 self._quota_strategy(
-                    [self._business_quota()], fill_remaining="no"
+                    [self._business_quota()], fill_remaining=False
                 ),
-                "fill_remaining must be boolean",
+                "Unsupported enrolment_ranking.selection_strategy keys: fill_remaining",
             ),
         ]
         for strategy, message in cases:
@@ -1647,7 +1645,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
         self.assertEqual(selection["pool_size"], 5)
 
-    def test_configured_count_quotas_leave_shortfall_unfilled(self):
+    def test_configured_count_quota_shortfall_goes_to_next_ranked(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 4,
@@ -1679,7 +1677,6 @@ class AuthoritativeEnrollmentTest(TestCase):
                                 }
                                 for city in ("Zomba", "Mzuzu")
                             ],
-                            "fill_remaining": False,
                         },
                     }
                 },
@@ -1699,12 +1696,13 @@ class AuthoritativeEnrollmentTest(TestCase):
             [], str(benefit_plan.id), "ACTIVE", self.user
         )
 
-        # Mzuzu has one applicant for two places; the spare place stays empty
-        # rather than going to a third Zomba or a Lilongwe applicant.
-        self.assertEqual(selection["will_enrol"], 3)
+        # Mzuzu has one applicant for two places, so the spare place goes to
+        # the next ranked applicant: the third Zomba applicant, ahead of
+        # Lilongwe by id. The Phase still reaches its target of 4.
+        self.assertEqual(selection["will_enrol"], 4)
         self.assertEqual(
             set(selection["selected_ids"]),
-            {zomba[0].id, zomba[1].id, mzuzu.id},
+            {zomba[0].id, zomba[1].id, mzuzu.id, zomba[2].id},
         )
 
     def test_group_selection_only_excludes_active_assignment_for_requested_status(self):
