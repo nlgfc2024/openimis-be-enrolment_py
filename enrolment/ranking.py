@@ -359,7 +359,7 @@ def _normalise_selection_strategy(selection_strategy, model):
         raise ValidationError(
             "enrolment_ranking.selection_strategy must be an object."
         )
-    allowed = {"source", "quotas", "fill_remaining", *SHORTHAND_QUOTA_KEYS}
+    allowed = {"source", "quotas", *SHORTHAND_QUOTA_KEYS}
     unexpected = set(selection_strategy) - allowed
     if unexpected:
         raise ValidationError(
@@ -379,12 +379,6 @@ def _normalise_selection_strategy(selection_strategy, model):
             "HOUSEHOLD_HEAD."
         )
 
-    fill_remaining = selection_strategy.get("fill_remaining", True)
-    if not isinstance(fill_remaining, bool):
-        raise ValidationError(
-            "enrolment_ranking.selection_strategy.fill_remaining must be boolean."
-        )
-
     if "quotas" in selection_strategy:
         shorthand = SHORTHAND_QUOTA_KEYS & set(selection_strategy)
         if shorthand:
@@ -396,11 +390,7 @@ def _normalise_selection_strategy(selection_strategy, model):
     else:
         quotas = _shorthand_quotas(selection_strategy)
 
-    return {
-        "source": source,
-        "quotas": quotas,
-        "fill_remaining": fill_remaining,
-    }
+    return {"source": source, "quotas": quotas}
 
 
 def _shorthand_quotas(selection_strategy):
@@ -934,8 +924,10 @@ def _select_quota_ids(ranked, selection_strategy, cap):
             ).values_list("id", flat=True)[:target]
         )
 
+    # Places the buckets leave unfilled always go to the next ranked candidates,
+    # so the Phase reaches its target whenever enough candidates are eligible.
     remaining = cap - len(selected_ids)
-    if remaining and strategy["fill_remaining"]:
+    if remaining:
         selected_ids.extend(
             candidates.exclude(id__in=selected_ids).values_list(
                 "id", flat=True

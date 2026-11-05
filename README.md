@@ -75,8 +75,7 @@ For other quotas, replace the female/youth keys with an ordered `quotas` list:
       "percentage": 10,
       "when": [{"derived": "age", "filter": "gte", "value": 60}]
     }
-  ],
-  "fill_remaining": false
+  ]
 }
 ```
 
@@ -89,13 +88,12 @@ For other quotas, replace the female/youth keys with an ordered `quotas` list:
   `value`. An optional `subject` must name the source (`self`,
   `primary_worker` or `head`).
 - Buckets fill in order from the ranked list, and nobody takes more than one
-  place. A bucket short of candidates leaves its places empty.
-- `fill_remaining` (default `true`) gives unfilled places to the next ranked
-  candidates. Set it to `false` to keep them empty.
+  place. Places a bucket cannot fill, and places no bucket reserves, then go to
+  the next ranked candidates, so the Phase reaches its target whenever enough
+  candidates are eligible.
 - `quotas` cannot be combined with `female_percentage`, `youth_percentage`,
   `female_value`, `youth_min_age` or `youth_max_age`. That shorthand is
-  equivalent to a `female` bucket followed by a `youth` bucket, with
-  `fill_remaining: true`.
+  equivalent to a `female` bucket followed by a `youth` bucket.
 
 ## Optional household district filter
 
