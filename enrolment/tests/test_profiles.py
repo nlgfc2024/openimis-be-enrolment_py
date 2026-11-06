@@ -65,7 +65,7 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
             (_criterion(field="   "), "field must be a json_ext key"),
             (_criterion(type="date"), "type must be one of"),
             (_criterion(filter="gte"), "filter gte is not allowed for string"),
-            (_criterion(type="integer", filter="gte", value="5"), "value must be a integer"),
+            (_criterion(type="integer", filter="gte", value="5"), "value must be of type integer"),
             (_criterion(derived="age"), "Unsupported"),
         ]
         for criterion, message in cases:

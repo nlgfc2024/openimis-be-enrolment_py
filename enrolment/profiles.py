@@ -112,7 +112,7 @@ def _criterion_errors(criterion, path):
     if filter_name not in FILTERS_BY_TYPE[value_type]:
         return [f"{path}.filter {filter_name} is not allowed for {value_type}."]
     if not VALUE_TYPES[value_type](criterion.get("value")):
-        return [f"{path}.value must be a {value_type}."]
+        return [f"{path}.value must be of type {value_type}."]
     return []
 
 
