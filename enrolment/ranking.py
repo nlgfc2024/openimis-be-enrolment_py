@@ -861,18 +861,18 @@ def _annotate_selection_source(queryset, source):
     )
 
 
-def _age_condition_q(filter_name, age):
-    """Translate an age comparison into a date-of-birth range on the source."""
+def _age_condition_q(dob_field, filter_name, age):
+    """Translate an age comparison into a date-of-birth range on ``dob_field``."""
     today = date.today()
     if filter_name == "gt":
         filter_name, age = "gte", age + 1
     elif filter_name == "lt":
         filter_name, age = "lte", age - 1
     if filter_name == "gte":
-        return Q(_selection_dob__lte=_years_ago_boundary(today, age))
+        return Q(**{f"{dob_field}__lte": _years_ago_boundary(today, age)})
     if filter_name == "lte":
-        return Q(_selection_dob__gte=_age_range_dob(today, 0, age)[0])
-    return Q(_selection_dob__range=_age_range_dob(today, age, age))
+        return Q(**{f"{dob_field}__gte": _age_range_dob(today, 0, age)[0]})
+    return Q(**{f"{dob_field}__range": _age_range_dob(today, age, age)})
 
 
 def _quota_q(conditions):
@@ -883,7 +883,9 @@ def _quota_q(conditions):
     field_conditions = []
     for condition in conditions:
         if condition.get("derived") == "age":
-            query &= _age_condition_q(condition["filter"], condition["value"])
+            query &= _age_condition_q(
+                "_selection_dob", condition["filter"], condition["value"]
+            )
         else:
             field_conditions.append(criterion_to_condition(condition))
     if field_conditions:

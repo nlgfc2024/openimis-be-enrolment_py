@@ -18,6 +18,7 @@ from enrolment.services import (
 )
 from enrolment.ranking import (
     HOUSEHOLD_HEAD_SOURCE,
+    _age_condition_q,
     _annotate_selection_source,
     _normalise_selection_strategy,
     _quota_q,
@@ -473,6 +474,17 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             with self.subTest(message=message):
                 with self.assertRaisesMessage(ValidationError, message):
                     _normalise_selection_strategy(strategy, Individual)
+
+    def test_age_condition_filters_the_given_dob_field(self):
+        sql = str(Individual.objects.filter(
+            _age_condition_q("dob", "gte", 18)
+        ).query)
+        self.assertIn('"dob" <=', sql)
+
+        sql = str(Individual.objects.filter(
+            _age_condition_q("dob", "exact", 30)
+        ).query)
+        self.assertIn('"dob" BETWEEN', sql)
 
     def test_configured_quota_conditions_are_validated(self):
         def with_condition(condition, source="SELF", model=Individual):
