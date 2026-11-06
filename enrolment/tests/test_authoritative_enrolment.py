@@ -524,7 +524,7 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             (
                 {"field": "workers", "filter": "gte",
                  "type": "integer", "value": "5"},
-                "value must be a integer",
+                "value must be of type integer",
             ),
             (
                 {"derived": "age", "filter": "gte", "value": 18.5},
