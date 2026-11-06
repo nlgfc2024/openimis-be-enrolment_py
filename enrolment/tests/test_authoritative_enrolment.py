@@ -1615,6 +1615,16 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
     def test_group_ranking_orders_by_household_head_pmt_score(self):
+        self._assert_orders_by_head_pmt_score(str)
+
+    def test_group_ranking_orders_by_numeric_household_head_pmt_score(self):
+        # Household validation stores the PMT score as a JSON number (D6).
+        self._assert_orders_by_head_pmt_score(
+            lambda score: int(score) if score.isdigit() else float(score)
+        )
+
+    def _assert_orders_by_head_pmt_score(self, stored):
+        """Rank households by the head's PMT score, stored with ``stored``."""
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "GROUP",
             "max_beneficiaries": 3,
@@ -1642,10 +1652,10 @@ class AuthoritativeEnrollmentTest(TestCase):
             return self._verified_group(individual_json_ext=json_ext)
 
         household(None)
-        richer = household("40.5")
-        poorest = household("8.25")
-        poorer = household("12")
-        household("55")
+        richer = household(stored("40.5"))
+        poorest = household(stored("8.25"))
+        poorer = household(stored("12"))
+        household(stored("55"))
 
         selection = build_group_enrollment_selection(
             [], str(benefit_plan.id), "ACTIVE", self.user
