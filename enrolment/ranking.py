@@ -543,22 +543,18 @@ def _normalise_quota_condition(condition, path, source):
     if ("field" in condition) == ("derived" in condition):
         raise ValidationError(f"{path} must set exactly one of field or derived.")
 
-    filter_name = condition.get("filter")
-    value = condition.get("value")
     if "derived" in condition:
-        if condition["derived"] != "age":
+        derived = DERIVED_QUOTA_VALUES.get(condition["derived"])
+        if derived is None:
             raise ValidationError(
                 f"{path}.derived {condition['derived']} is not supported; "
-                "only age is."
+                "supported values: " + ", ".join(sorted(DERIVED_QUOTA_VALUES)) + "."
             )
-        if condition.get("type", "integer") != "integer":
-            raise ValidationError(f"{path}.type must be integer for age.")
-        if filter_name not in FILTERS_BY_TYPE["integer"]:
-            raise ValidationError(f"{path}.filter {filter_name} is not allowed for age.")
-        if type(value) is not int or not 0 <= value <= 120:
-            raise ValidationError(f"{path}.value must be an age from 0 to 120.")
-        return {"derived": "age", "filter": filter_name, "value": value}
+        normalise, _ = derived
+        return normalise(condition, path)
 
+    filter_name = condition.get("filter")
+    value = condition.get("value")
     field = condition["field"]
     if (
         not isinstance(field, str)
@@ -585,6 +581,18 @@ def _normalise_quota_condition(condition, path, source):
         "type": value_type,
         "value": value,
     }
+
+
+def _normalise_age_condition(condition, path):
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    if condition.get("type", "integer") != "integer":
+        raise ValidationError(f"{path}.type must be integer for age.")
+    if filter_name not in FILTERS_BY_TYPE["integer"]:
+        raise ValidationError(f"{path}.filter {filter_name} is not allowed for age.")
+    if type(value) is not int or not 0 <= value <= 120:
+        raise ValidationError(f"{path}.value must be an age from 0 to 120.")
+    return {"derived": "age", "filter": filter_name, "value": value}
 
 
 def validate_ranking_spec(ranking, model, beneficiary_schema=None):
@@ -875,6 +883,19 @@ def _age_condition_q(dob_field, filter_name, age):
     return Q(**{f"{dob_field}__range": _age_range_dob(today, age, age)})
 
 
+def _age_quota_q(condition):
+    return _age_condition_q(
+        "_selection_dob", condition["filter"], condition["value"]
+    )
+
+
+# Derived values a quota condition may use: name -> (validate and normalise
+# the condition, build its filter on the annotated selection source).
+DERIVED_QUOTA_VALUES = {
+    "age": (_normalise_age_condition, _age_quota_q),
+}
+
+
 def _quota_q(conditions):
     """Combine a quota's conditions on the selection source into one filter."""
     from individual.models import Individual
@@ -882,10 +903,9 @@ def _quota_q(conditions):
     query = Q()
     field_conditions = []
     for condition in conditions:
-        if condition.get("derived") == "age":
-            query &= _age_condition_q(
-                "_selection_dob", condition["filter"], condition["value"]
-            )
+        if "derived" in condition:
+            _, condition_q = DERIVED_QUOTA_VALUES[condition["derived"]]
+            query &= condition_q(condition)
         else:
             field_conditions.append(criterion_to_condition(condition))
     if field_conditions:
