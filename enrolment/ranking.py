@@ -60,6 +60,8 @@ SHORTHAND_QUOTA_KEYS = {
     "youth_max_age",
 }
 # Value types the Individual custom filter wizard can cast for quota conditions.
+# This duplicates the type list behind criteria.FILTERS_BY_TYPE; change C12 in
+# the enrolment requirements assessment merges them into one shared list.
 QUOTA_VALUE_TYPES = {
     "string": lambda value: isinstance(value, str),
     "integer": lambda value: type(value) is int,
