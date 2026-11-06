@@ -32,6 +32,12 @@ a programme, so they don't have to be copied into each Phase. Profiles are keyed
 by `BenefitPlan.code`, matched without regard to case. A Phase whose code has no
 profile uses `default`; without a `default` it uses only its own criteria.
 
+A profile does not yet say which Phase type it is for, so `default` applies to
+GROUP and INDIVIDUAL Phases alike. On an instance with both types, keep
+`household` and member subjects out of `default`: an INDIVIDUAL Phase that
+falls back to it fails when enrolment runs. Put those criteria in profiles keyed
+by the GROUP Phases' codes instead.
+
 ```json
 "programme_profiles": {
   "RMEP": {
