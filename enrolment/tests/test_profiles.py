@@ -66,6 +66,7 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
             (_criterion(type="date"), "type must be one of"),
             (_criterion(filter="gte"), "filter gte is not allowed for string"),
             (_criterion(type="integer", filter="gte", value="5"), "value must be of type integer"),
+            (_criterion(type="numeric", filter="gte", value=float("inf")), "value must be of type numeric"),
             (_criterion(derived="age"), "Unsupported"),
         ]
         for criterion, message in cases:

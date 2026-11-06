@@ -16,6 +16,7 @@ from enrolment.membership import (
     authoritative_primary_worker_memberships,
     household_head_memberships,
 )
+from enrolment.ranking import _is_number
 
 
 DEFAULT_PROFILE = "default"
@@ -35,9 +36,7 @@ SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
 VALUE_TYPES = {
     "string": lambda value: isinstance(value, str),
     "integer": lambda value: type(value) is int,
-    "numeric": lambda value: (
-        isinstance(value, (int, float)) and not isinstance(value, bool)
-    ),
+    "numeric": _is_number,
     "boolean": lambda value: isinstance(value, bool),
 }
 
