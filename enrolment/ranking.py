@@ -24,7 +24,10 @@ from django.db.models.functions import Cast
 from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
 from enrolment.criteria import FILTERS_BY_TYPE, criterion_to_condition
-from enrolment.membership import authoritative_primary_worker_memberships
+from enrolment.membership import (
+    authoritative_primary_worker_memberships,
+    household_head_memberships,
+)
 
 
 SUPPORTED_CASTS = {
@@ -836,19 +839,12 @@ def _age_range_dob(today, minimum_age, maximum_age):
 
 def _household_member(source):
     """Return the outer household's head or primary-worker membership."""
-    from individual.models import GroupIndividual
-
-    if source == HOUSEHOLD_HEAD_SOURCE:
-        return GroupIndividual.objects.filter(
-            group_id=OuterRef("pk"),
-            is_deleted=False,
-            group__is_deleted=False,
-            individual__is_deleted=False,
-            role=GroupIndividual.Role.HEAD,
-        ).order_by("id")
-    return authoritative_primary_worker_memberships().filter(
-        group_id=OuterRef("pk")
-    ).order_by("id")
+    memberships = (
+        household_head_memberships()
+        if source == HOUSEHOLD_HEAD_SOURCE
+        else authoritative_primary_worker_memberships()
+    )
+    return memberships.filter(group_id=OuterRef("pk")).order_by("id")
 
 
 def _annotate_selection_source(queryset, source):
