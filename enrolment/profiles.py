@@ -31,8 +31,11 @@ MEMBER_SUBJECTS = {
     "head": household_head_memberships,
     "any_member": active_household_memberships,
 }
+# The ranking module keeps matching subject names for order_by and quotas;
+# change C12 in the enrolment requirements assessment merges them into one list.
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
-# Value types the individual module's custom filter wizards can cast.
+# Value types the individual module's custom filter wizards can cast. This
+# duplicates the type list behind criteria.FILTERS_BY_TYPE; C12 merges them.
 VALUE_TYPES = {
     "string": lambda value: isinstance(value, str),
     "integer": lambda value: type(value) is int,
