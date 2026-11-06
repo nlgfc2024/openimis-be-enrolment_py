@@ -1578,6 +1578,11 @@ class AuthoritativeEnrollmentTest(TestCase):
                 "json_ext": {"gender": head_gender},
             })
             add_individual_to_group(self.user.username, head, group)
+            # Saving a membership copies the head's json_ext onto the household
+            # and drops validation_status, so verify the household again.
+            group.refresh_from_db()
+            group.json_ext = {**(group.json_ext or {}), "validation_status": "VERIFIED"}
+            group.save(username=self.user.username)
             return group
 
         household("Male", 50)
