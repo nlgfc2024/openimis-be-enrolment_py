@@ -11,7 +11,10 @@ from individual.tests.test_helpers import (
     create_group,
     create_individual,
 )
+from social_protection.models import BenefitPlanDataUploadRecords, GroupBeneficiary
 from social_protection.tests.test_helpers import create_benefit_plan
+from tasks_management.models import Task
+from tasks_management.services import TaskService
 
 from enrolment.apps import DEFAULT_CONFIG, EnrolmentConfig
 from enrolment.profiles import (
@@ -19,7 +22,7 @@ from enrolment.profiles import (
     resolve_programme_profile,
     validate_programme_profiles,
 )
-from enrolment.services import build_group_enrolment_selection
+from enrolment.services import EnrolmentService, build_group_enrolment_selection
 
 
 def _criterion(**overrides):
@@ -187,7 +190,7 @@ class ProgrammeProfileEligibilityTest(SimpleTestCase):
 
 
 class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
-    """Profiles applied to real registry records."""
+    """Profiles applied to real registry records, through preview and approval."""
 
     def setUp(self):
         for name, value in (
@@ -306,3 +309,42 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
         ])
 
         self.assertEqual(self._eligible(plan), {one_member.id})
+
+    @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
+    def test_approval_rechecks_a_profile_changed_after_confirmation(self):
+        token = "profile-approval"
+        experienced = _criterion(
+            subject="primary_worker", field="business_experience", value="Yes",
+        )
+        plan = self._plan(token, [experienced])
+        retail = self._household(
+            token, [{"business_experience": "Yes", "sector": "Retail"}]
+        )
+        farming = self._household(
+            token, [{"business_experience": "Yes", "sector": "Farming"}]
+        )
+        self.assertEqual(self._eligible(plan), {retail.id, farming.id})
+
+        EnrolmentService(self.admin_user).select_groups_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+        # The profile is narrowed while the enrolment awaits approval, so the
+        # staged farming household is no longer eligible.
+        self._set_profile(plan, [
+            experienced,
+            _criterion(subject="primary_worker", field="sector", value="Retail"),
+        ])
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertFalse(
+            GroupBeneficiary.objects.filter(
+                benefit_plan=plan, is_deleted=False
+            ).exists()
+        )
