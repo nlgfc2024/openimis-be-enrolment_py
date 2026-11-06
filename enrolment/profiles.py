@@ -98,7 +98,12 @@ def _criterion_errors(criterion, path):
     if subject is not None and subject not in SUBJECTS:
         return [f"{path}.subject must be one of " + ", ".join(sorted(SUBJECTS)) + "."]
     field = criterion.get("field")
-    if not isinstance(field, str) or not field or "__" in field or "=" in field:
+    if (
+        not isinstance(field, str)
+        or not field.strip()
+        or "__" in field
+        or "=" in field
+    ):
         return [f"{path}.field must be a json_ext key."]
     value_type = criterion.get("type")
     if value_type not in VALUE_TYPES:
