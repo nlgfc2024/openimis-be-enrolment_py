@@ -918,7 +918,7 @@ def _quota_q(conditions):
 
 
 def _select_quota_ids(ranked, selection_strategy, cap):
-    """Fill quota buckets in order, then optionally the ranked fallback.
+    """Fill quota buckets in order, then the remaining places from the ranked list.
 
     ``ranked`` already carries the configured weighted/deterministic ordering.
     Each bucket and the fallback retain that ordering, and exclusions ensure one

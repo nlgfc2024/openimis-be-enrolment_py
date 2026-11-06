@@ -38,9 +38,10 @@ an `order_by` object: `head` (the member with role `HEAD`) or `primary_worker`
 ```
 
 INDIVIDUAL Phases accept only `subject: self`, which is the same as leaving it
-out. A benefit plan without a
-ranking configuration retains the legacy behaviour and does not apply
-`max_beneficiaries` as a selection cap.
+out.
+
+A benefit plan without a ranking configuration retains the legacy behaviour and
+does not apply `max_beneficiaries` as a selection cap.
 
 Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
