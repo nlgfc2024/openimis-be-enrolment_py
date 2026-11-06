@@ -500,7 +500,7 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             ),
             (
                 {"derived": "district", "filter": "exact", "value": "Zomba"},
-                "derived district is not supported",
+                "derived district is not supported; supported values: age",
             ),
             (
                 {"field": "gender", "derived": "age", "filter": "gte", "value": 1},
