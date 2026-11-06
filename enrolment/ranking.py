@@ -577,7 +577,7 @@ def _normalise_quota_condition(condition, path, source):
             f"{path}.filter {filter_name} is not allowed for {value_type}."
         )
     if not QUOTA_VALUE_TYPES[value_type](value):
-        raise ValidationError(f"{path}.value must be a {value_type}.")
+        raise ValidationError(f"{path}.value must be of type {value_type}.")
     return {
         "field": field,
         "filter": filter_name,
