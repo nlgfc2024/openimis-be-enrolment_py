@@ -26,13 +26,75 @@ with `validation_enrollment` and `validation_group_enrollment`.
 ## Ranking and confirmation
 
 Ranking paths may reference a concrete model field or a scalar `json_ext` key.
-Related and other multi-valued paths are rejected. A benefit plan without a
-ranking configuration retains the legacy behaviour and does not apply
-`max_beneficiaries` as a selection cap.
+Related and other multi-valued paths are rejected.
+
+GROUP Phases can also order households by a member's value. Add `subject` to
+an `order_by` object: `head` (the member with role `HEAD`) or `primary_worker`
+(the verified primary worker). `field` is then a key in that member's
+`json_ext`, for example to rank households by the PMT score stored on the head:
+
+```json
+{"subject": "head", "field": "household_pmt_score", "cast": "float", "direction": "asc", "nulls": "last"}
+```
+
+INDIVIDUAL Phases accept only `subject: self`, which is the same as leaving it
+out.
+
+A benefit plan without a ranking configuration retains the legacy behaviour and
+does not apply `max_beneficiaries` as a selection cap.
 
 Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
 against current registry and beneficiary data in the same transaction.
+
+## Selection quotas
+
+`enrolment_ranking[status].selection_strategy` reserves places in the ranked
+list for female and youth candidates (`female_percentage`, `youth_percentage`).
+`source` names the person whose gender and date of birth are checked:
+
+- INDIVIDUAL Phases: `SELF`.
+- GROUP Phases: `PRIMARY_WORKER` (the household's verified primary worker) or
+  `HOUSEHOLD_HEAD` (the member with role `HEAD`, for female- or youth-headed
+  household quotas).
+
+For other quotas, replace the female/youth keys with an ordered `quotas` list:
+
+```json
+"selection_strategy": {
+  "source": "SELF",
+  "quotas": [
+    {
+      "key": "zomba",
+      "count": 87,
+      "when": [
+        {"field": "city", "filter": "iexact", "type": "string", "value": "Zomba"}
+      ]
+    },
+    {
+      "key": "older",
+      "percentage": 10,
+      "when": [{"derived": "age", "filter": "gte", "value": 60}]
+    }
+  ]
+}
+```
+
+- Each bucket has a unique `key`, exactly one of `percentage` (of the cap,
+  rounded down) or `count`, and a non-empty `when` list. Percentages may add up
+  to at most 100.
+- `when` conditions all apply to the `source` person. A condition is either a
+  `json_ext` `field` with `filter`, `type` (`string`, `integer`, `numeric` or
+  `boolean`) and `value`, or `derived: age` with an integer `filter` and
+  `value`. An optional `subject` must name the source (`self`,
+  `primary_worker` or `head`).
+- Buckets fill in order from the ranked list, and nobody takes more than one
+  place. Places a bucket cannot fill, and places no bucket reserves, then go to
+  the next ranked candidates, so the Phase reaches its target whenever enough
+  candidates are eligible.
+- `quotas` cannot be combined with `female_percentage`, `youth_percentage`,
+  `female_value`, `youth_min_age` or `youth_max_age`. That shorthand is
+  equivalent to a `female` bucket followed by a `youth` bucket.
 
 ## Optional household district filter
 

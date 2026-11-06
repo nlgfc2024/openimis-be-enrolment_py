@@ -18,7 +18,10 @@ from enrolment.services import (
 )
 from enrolment.ranking import (
     HOUSEHOLD_HEAD_SOURCE,
+    _age_condition_q,
     _annotate_selection_source,
+    _normalise_selection_strategy,
+    _quota_q,
     calculate_cap,
     build_order_by,
     build_weighted_score,
@@ -26,7 +29,7 @@ from enrolment.ranking import (
     rank_and_cap_queryset,
     validate_ranking_spec,
 )
-from individual.models import Group, Individual
+from individual.models import Group, GroupIndividual, Individual
 from enrolment.schema import Query
 from individual.custom_filters import GroupCustomFilterWizard, IndividualCustomFilterWizard
 from individual.tests.test_helpers import (
@@ -295,6 +298,27 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                 },
             }, Individual)
 
+    def test_group_selection_strategy_accepts_primary_worker_or_head(self):
+        for source in ("PRIMARY_WORKER", HOUSEHOLD_HEAD_SOURCE):
+            validate_ranking_spec({
+                "selection_strategy": {
+                    "source": source,
+                    "female_percentage": 40,
+                    "youth_percentage": 40,
+                },
+            }, Group)
+
+        with self.assertRaisesMessage(
+            ValidationError,
+            "source must be PRIMARY_WORKER or HOUSEHOLD_HEAD",
+        ):
+            validate_ranking_spec({
+                "selection_strategy": {
+                    "source": "SELF",
+                    "female_percentage": 40,
+                },
+            }, Group)
+
     def test_primary_worker_weighted_score_compiles_to_sql(self):
         from individual.models import Group
 
@@ -325,16 +349,211 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
     def test_household_quota_source_compiles_gender_and_dob_to_sql(self):
         from individual.models import Group
 
+        strategy = _normalise_selection_strategy({
+            "source": HOUSEHOLD_HEAD_SOURCE,
+            "female_percentage": 40,
+            "youth_percentage": 40,
+        }, Group)
         candidates = _annotate_selection_source(
             Group.objects.all(),
             HOUSEHOLD_HEAD_SOURCE,
         )
+        for quota in strategy["quotas"]:
+            candidates = candidates.filter(_quota_q(quota["when"]))
 
         sql = str(candidates.query)
         self.assertIn("individual_individual", sql)
         self.assertIn("gender", sql)
         self.assertIn("dob", sql.lower())
         self.assertIn("HEAD", sql)
+
+    def test_shorthand_quotas_become_female_then_youth_buckets(self):
+        strategy = _normalise_selection_strategy({
+            "source": "SELF",
+            "female_percentage": 60,
+            "youth_percentage": 40,
+            "youth_min_age": 18,
+            "youth_max_age": 35,
+        }, Individual)
+
+        self.assertEqual(
+            [(quota["key"], quota["percentage"]) for quota in strategy["quotas"]],
+            [("female", 60), ("youth", 40)],
+        )
+        self.assertEqual(strategy["quotas"][0]["when"][0]["value"], "Female")
+        self.assertEqual(
+            [(c["filter"], c["value"]) for c in strategy["quotas"][1]["when"]],
+            [("gte", 18), ("lte", 35)],
+        )
+
+    def _quota_strategy(self, quotas, source="SELF", **extra):
+        return {"source": source, "quotas": quotas, **extra}
+
+    def _business_quota(self, **overrides):
+        return {
+            "key": "business",
+            "percentage": 50,
+            "when": [{
+                "field": "business_type",
+                "filter": "exact",
+                "type": "string",
+                "value": "Retail",
+            }],
+            **overrides,
+        }
+
+    def test_configured_quotas_are_normalised_in_order(self):
+        strategy = _normalise_selection_strategy(self._quota_strategy([
+            self._business_quota(),
+            {
+                "key": "older",
+                "count": 10,
+                "when": [{
+                    "subject": "self",
+                    "derived": "age",
+                    "filter": "gte",
+                    "value": 60,
+                }],
+            },
+        ]), Individual)
+
+        self.assertEqual(
+            [quota["key"] for quota in strategy["quotas"]],
+            ["business", "older"],
+        )
+        self.assertEqual(strategy["quotas"][0]["percentage"], 50)
+        self.assertEqual(strategy["quotas"][1]["count"], 10)
+        self.assertEqual(
+            strategy["quotas"][1]["when"],
+            [{"derived": "age", "filter": "gte", "value": 60}],
+        )
+
+    def test_configured_quotas_reject_invalid_buckets(self):
+        cases = [
+            (
+                self._quota_strategy([self._business_quota()], female_percentage=40),
+                "cannot be combined with female_percentage",
+            ),
+            (self._quota_strategy([]), "quotas must be a non-empty list"),
+            (
+                self._quota_strategy([
+                    self._business_quota(),
+                    self._business_quota(key="other", percentage=60),
+                ]),
+                "percentages cannot exceed 100",
+            ),
+            (
+                self._quota_strategy([
+                    self._business_quota(),
+                    self._business_quota(percentage=10),
+                ]),
+                "key business is used more than once",
+            ),
+            (
+                self._quota_strategy([self._business_quota(count=5)]),
+                "exactly one of percentage or count",
+            ),
+            (
+                self._quota_strategy([
+                    {"key": "business", "count": 0, "when": [{}]},
+                ]),
+                "count must be a positive integer",
+            ),
+            (
+                self._quota_strategy([self._business_quota(when=[])]),
+                "when must be a non-empty list",
+            ),
+            (
+                self._quota_strategy(
+                    [self._business_quota()], fill_remaining=False
+                ),
+                "Unsupported enrolment_ranking.selection_strategy keys: fill_remaining",
+            ),
+        ]
+        for strategy, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    _normalise_selection_strategy(strategy, Individual)
+
+    def test_age_condition_filters_the_given_dob_field(self):
+        sql = str(Individual.objects.filter(
+            _age_condition_q("dob", "gte", 18)
+        ).query)
+        self.assertIn('"dob" <=', sql)
+
+        sql = str(Individual.objects.filter(
+            _age_condition_q("dob", "exact", 30)
+        ).query)
+        self.assertIn('"dob" BETWEEN', sql)
+
+    def test_configured_quota_conditions_are_validated(self):
+        def with_condition(condition, source="SELF", model=Individual):
+            _normalise_selection_strategy(self._quota_strategy(
+                [self._business_quota(when=[condition])], source=source,
+            ), model)
+
+        cases = [
+            (
+                {"subject": "head", "field": "gender", "filter": "exact",
+                 "type": "string", "value": "Female"},
+                "subject must be self when the selection_strategy.source is SELF",
+            ),
+            (
+                {"derived": "district", "filter": "exact", "value": "Zomba"},
+                "derived district is not supported; supported values: age",
+            ),
+            (
+                {"field": "gender", "derived": "age", "filter": "gte", "value": 1},
+                "exactly one of field or derived",
+            ),
+            (
+                {"field": "gender__isnull", "filter": "exact",
+                 "type": "boolean", "value": True},
+                "field must be a json_ext key",
+            ),
+            (
+                {"field": "registered", "filter": "exact",
+                 "type": "date", "value": "2026-01-01"},
+                "type must be one of",
+            ),
+            (
+                {"field": "gender", "filter": "gte",
+                 "type": "string", "value": "Female"},
+                "filter gte is not allowed for string",
+            ),
+            (
+                {"field": "workers", "filter": "gte",
+                 "type": "integer", "value": "5"},
+                "value must be of type integer",
+            ),
+            (
+                {"derived": "age", "filter": "gte", "value": 18.5},
+                "value must be an age from 0 to 120",
+            ),
+        ]
+        for condition, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    with_condition(condition)
+
+        with_condition(
+            {"subject": "head", "field": "gender", "filter": "iexact",
+             "type": "string", "value": "Female"},
+            source=HOUSEHOLD_HEAD_SOURCE,
+            model=Group,
+        )
+
+    def test_configured_quota_compiles_field_condition_on_primary_worker(self):
+        strategy = _normalise_selection_strategy(self._quota_strategy(
+            [self._business_quota()], source="PRIMARY_WORKER",
+        ), Group)
+        candidates = _annotate_selection_source(
+            Group.objects.all(), "PRIMARY_WORKER",
+        ).filter(_quota_q(strategy["quotas"][0]["when"]))
+
+        sql = str(candidates.query)
+        self.assertIn("business_type", sql)
+        self.assertIn("primary_worker", sql)
 
     def test_string_json_ext_snapshot_uses_status_then_wildcard(self):
         plan = Mock(json_ext='{"enrolment_ranking":{"*":{"order_by":["id"]},"ACTIVE":{"order_by":["-id"]}}}')
@@ -360,6 +579,78 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         self.assertIn("_enrolment_rank_", sql)
         self.assertIn("NULLS LAST", sql)
         self.assertIn("integer", sql)
+
+    def test_group_ordering_reads_household_head_json_ext(self):
+        order_items, _, _ = validate_ranking_spec({
+            "order_by": [{
+                "subject": "head",
+                "field": "household_pmt_score",
+                "cast": "float",
+                "nulls": "last",
+            }],
+        }, Group, {"properties": {"other": {"type": "string"}}})
+
+        self.assertEqual(order_items[0]["subject"], "head")
+        self.assertEqual(order_items[0]["direction"], "asc")
+        sql = str(build_order_by(Group.objects.all(), order_items).query)
+        self.assertIn("household_pmt_score", sql)
+        self.assertIn("HEAD", sql)
+        self.assertIn("double precision", sql)
+        self.assertIn("NULLS LAST", sql)
+
+    def test_group_ordering_reads_primary_worker_json_ext(self):
+        order_items, _, _ = validate_ranking_spec({
+            "order_by": [{
+                "subject": "primary_worker",
+                "field": "business_period",
+                "direction": "desc",
+            }],
+        }, Group)
+
+        sql = str(build_order_by(Group.objects.all(), order_items).query)
+        self.assertIn("business_period", sql)
+        self.assertIn("primary_worker", sql)
+
+    def test_member_ordering_subjects_are_validated(self):
+        cases = [
+            (
+                {"subject": "head", "field": "household_pmt_score"},
+                Individual,
+                "subject must be self",
+            ),
+            (
+                {"subject": "self", "field": "household_pmt_score"},
+                Group,
+                "subject must be head or primary_worker",
+            ),
+            (
+                {"subject": "head", "field": "json_ext__household_pmt_score"},
+                Group,
+                "must be a json_ext key on the head",
+            ),
+        ]
+        for item, model, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    validate_ranking_spec({"order_by": [item]}, model)
+
+        order_items, _, _ = validate_ranking_spec({
+            "order_by": [{"subject": "self", "field": "dob"}],
+        }, Individual)
+        self.assertNotIn("subject", order_items[0])
+
+    def test_member_ordering_does_not_satisfy_weighted_score_ordering(self):
+        with self.assertRaisesMessage(ValidationError, "must include _weighted_score"):
+            validate_ranking_spec({
+                "weighted_score": {
+                    "components": [{
+                        "field": "business_period",
+                        "weight": 1,
+                        "scoring": {"type": "mapping", "values": {"Yes": 1}},
+                    }],
+                },
+                "order_by": [{"subject": "head", "field": "_weighted_score"}],
+            }, Group)
 
     def test_ranking_rejects_multi_valued_relation_paths(self):
         with self.assertRaisesMessage(ValidationError, "multi-valued path"):
@@ -1262,6 +1553,183 @@ class AuthoritativeEnrollmentTest(TestCase):
                 .values_list("id", flat=True)
             ),
             {young.id, female.id},
+        )
+
+    def test_group_quotas_can_use_household_head_gender_and_dob(self):
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "GROUP",
+            "max_beneficiaries": 2,
+            "beneficiary_data_schema": {"properties": {}},
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
+                "enrolment_ranking": {
+                    "ACTIVE": {
+                        "order_by": ["id"],
+                        "selection_strategy": {
+                            "source": "HOUSEHOLD_HEAD",
+                            "female_percentage": 50,
+                            "youth_percentage": 50,
+                        },
+                    }
+                }
+            },
+        })
+
+        def household(head_gender, head_age):
+            # The primary worker is always an older man, so only the head's
+            # gender and age can place the household in a quota.
+            group = self._verified_group(
+                individual_json_ext={"gender": "Male"},
+                dob=date(date.today().year - 50, 1, 1),
+            )
+            GroupIndividual.objects.filter(group=group).update(
+                role=GroupIndividual.Role.SON
+            )
+            head = create_individual(self.user.username, {
+                "dob": date(date.today().year - head_age, 1, 1),
+                "json_ext": {"gender": head_gender},
+            })
+            add_individual_to_group(self.user.username, head, group)
+            # Saving a membership copies the head's json_ext onto the household
+            # and drops validation_status, so verify the household again.
+            group.refresh_from_db()
+            group.json_ext = {**(group.json_ext or {}), "validation_status": "VERIFIED"}
+            group.save(username=self.user.username)
+            return group
+
+        household("Male", 50)
+        young_head = household("Male", 25)
+        female_head = household("Female", 45)
+
+        selection = build_group_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        self.assertEqual(selection["will_enrol"], 2)
+        self.assertEqual(
+            set(
+                selection["groups_not_assigned_to_selected_programme"]
+                .values_list("id", flat=True)
+            ),
+            {young_head.id, female_head.id},
+        )
+
+    def test_group_ranking_orders_by_household_head_pmt_score(self):
+        self._assert_orders_by_head_pmt_score(str)
+
+    def test_group_ranking_orders_by_numeric_household_head_pmt_score(self):
+        # Household validation stores the PMT score as a JSON number (D6).
+        self._assert_orders_by_head_pmt_score(
+            lambda score: int(score) if score.isdigit() else float(score)
+        )
+
+    def _assert_orders_by_head_pmt_score(self, stored):
+        """Rank households by the head's PMT score, stored with ``stored``."""
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "GROUP",
+            "max_beneficiaries": 3,
+            "beneficiary_data_schema": {"properties": {}},
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": []},
+                "enrolment_ranking": {
+                    "ACTIVE": {
+                        "order_by": [{
+                            "subject": "head",
+                            "field": "household_pmt_score",
+                            "cast": "float",
+                            "direction": "asc",
+                            "nulls": "last",
+                        }],
+                    }
+                },
+            },
+        })
+
+        def household(pmt_score):
+            json_ext = {}
+            if pmt_score is not None:
+                json_ext["household_pmt_score"] = pmt_score
+            return self._verified_group(individual_json_ext=json_ext)
+
+        household(None)
+        richer = household(stored("40.5"))
+        poorest = household(stored("8.25"))
+        poorer = household(stored("12"))
+        household(stored("55"))
+
+        selection = build_group_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        # Lowest PMT first; a household without a score sorts last and loses
+        # its place to scored households.
+        self.assertEqual(
+            list(
+                selection["groups_not_assigned_to_selected_programme"]
+                .values_list("id", flat=True)
+            ),
+            [poorest.id, poorer.id, richer.id],
+        )
+        self.assertEqual(selection["pool_size"], 5)
+
+    def test_configured_count_quota_shortfall_goes_to_next_ranked(self):
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "INDIVIDUAL",
+            "max_beneficiaries": 4,
+            "beneficiary_data_schema": {
+                "properties": {"quota_scope": {"type": "string"}}
+            },
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": [{
+                    "field": "quota_scope",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "city-quotas",
+                }]},
+                "enrolment_ranking": {
+                    "ACTIVE": {
+                        "order_by": ["id"],
+                        "selection_strategy": {
+                            "source": "SELF",
+                            "quotas": [
+                                {
+                                    "key": city.lower(),
+                                    "count": 2,
+                                    "when": [{
+                                        "field": "city",
+                                        "filter": "exact",
+                                        "type": "string",
+                                        "value": city,
+                                    }],
+                                }
+                                for city in ("Zomba", "Mzuzu")
+                            ],
+                        },
+                    }
+                },
+            },
+        })
+
+        def applicant(city):
+            return create_individual(self.user.username, {
+                "json_ext": {"quota_scope": "city-quotas", "city": city},
+            })
+
+        zomba = [applicant("Zomba") for _ in range(3)]
+        mzuzu = applicant("Mzuzu")
+        applicant("Lilongwe")
+
+        selection = build_individual_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        # Mzuzu has one applicant for two places, so the spare place goes to
+        # the next ranked applicant: the third Zomba applicant, ahead of
+        # Lilongwe by id. The Phase still reaches its target of 4.
+        self.assertEqual(selection["will_enrol"], 4)
+        self.assertEqual(
+            set(selection["selected_ids"]),
+            {zomba[0].id, zomba[1].id, mzuzu.id, zomba[2].id},
         )
 
     def test_group_selection_only_excludes_active_assignment_for_requested_status(self):

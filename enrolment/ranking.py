@@ -13,6 +13,7 @@ from django.db.models import (
     FloatField,
     IntegerField,
     OuterRef,
+    Q,
     Subquery,
     Value,
     When,
@@ -20,8 +21,13 @@ from django.db.models import (
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast
 
+from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
-from enrolment.membership import authoritative_primary_worker_memberships
+from enrolment.criteria import FILTERS_BY_TYPE, criterion_to_condition
+from enrolment.membership import (
+    authoritative_primary_worker_memberships,
+    household_head_memberships,
+)
 
 
 SUPPORTED_CASTS = {
@@ -36,6 +42,32 @@ WEIGHTED_SCORE_FIELD = "_weighted_score"
 PRIMARY_WORKER_SOURCE = "PRIMARY_WORKER"
 HOUSEHOLD_HEAD_SOURCE = "HOUSEHOLD_HEAD"
 SELF_SOURCE = "SELF"
+SOURCE_SUBJECTS = {
+    SELF_SOURCE: "self",
+    PRIMARY_WORKER_SOURCE: "primary_worker",
+    HOUSEHOLD_HEAD_SOURCE: "head",
+}
+# Household members whose json_ext a GROUP order_by item may read.
+MEMBER_SUBJECT_SOURCES = {
+    SOURCE_SUBJECTS[HOUSEHOLD_HEAD_SOURCE]: HOUSEHOLD_HEAD_SOURCE,
+    SOURCE_SUBJECTS[PRIMARY_WORKER_SOURCE]: PRIMARY_WORKER_SOURCE,
+}
+SHORTHAND_QUOTA_KEYS = {
+    "female_percentage",
+    "youth_percentage",
+    "female_value",
+    "youth_min_age",
+    "youth_max_age",
+}
+# Value types the Individual custom filter wizard can cast for quota conditions.
+# This duplicates the type list behind criteria.FILTERS_BY_TYPE; change C12 in
+# the enrolment requirements assessment merges them into one shared list.
+QUOTA_VALUE_TYPES = {
+    "string": lambda value: isinstance(value, str),
+    "integer": lambda value: type(value) is int,
+    "numeric": lambda value: _is_number(value),
+    "boolean": lambda value: isinstance(value, bool),
+}
 
 
 def load_ranking_spec(benefit_plan, status):
@@ -94,7 +126,9 @@ def _normalise_order_item(
         field = item[1:] if item.startswith("-") else item
         result = {"field": field, "direction": direction}
     elif isinstance(item, dict):
-        unexpected = set(item) - {"field", "direction", "cast", "nulls"}
+        unexpected = set(item) - {
+            "subject", "field", "direction", "cast", "nulls",
+        }
         if unexpected:
             raise ValidationError(
                 f"Unsupported enrolment_ranking.order_by[{index}] keys: "
@@ -105,12 +139,37 @@ def _normalise_order_item(
     else:
         raise ValidationError(f"enrolment_ranking.order_by[{index}] must be a string or object.")
 
-    _validate_model_path(
-        model,
-        result.get("field"),
-        extra_fields,
-        schema_fields,
-    )
+    subject = result.pop("subject", None)
+    if model._meta.model_name == "individual":
+        if subject not in {None, SOURCE_SUBJECTS[SELF_SOURCE]}:
+            raise ValidationError(
+                f"INDIVIDUAL enrolment_ranking.order_by[{index}].subject "
+                "must be self."
+            )
+        subject = None
+    elif subject is not None and subject not in MEMBER_SUBJECT_SOURCES:
+        raise ValidationError(
+            f"GROUP enrolment_ranking.order_by[{index}].subject must be "
+            "head or primary_worker."
+        )
+
+    if subject is None:
+        _validate_model_path(
+            model,
+            result.get("field"),
+            extra_fields,
+            schema_fields,
+        )
+    else:
+        # Member values come from Individual.json_ext, which the Phase's
+        # beneficiary_data_schema does not describe.
+        field = result.get("field")
+        if not isinstance(field, str) or not field or "__" in field:
+            raise ValidationError(
+                f"enrolment_ranking.order_by[{index}].field must be a json_ext "
+                f"key on the {subject}."
+            )
+        result["subject"] = subject
     if result["direction"] not in SUPPORTED_DIRECTIONS:
         raise ValidationError(f"Unsupported ranking direction: {result['direction']}.")
     if result.get("cast") not in ({None} | set(SUPPORTED_CASTS)):
@@ -305,14 +364,7 @@ def _normalise_selection_strategy(selection_strategy, model):
         raise ValidationError(
             "enrolment_ranking.selection_strategy must be an object."
         )
-    allowed = {
-        "source",
-        "female_percentage",
-        "youth_percentage",
-        "female_value",
-        "youth_min_age",
-        "youth_max_age",
-    }
+    allowed = {"source", "quotas", *SHORTHAND_QUOTA_KEYS}
     unexpected = set(selection_strategy) - allowed
     if unexpected:
         raise ValidationError(
@@ -326,11 +378,28 @@ def _normalise_selection_strategy(selection_strategy, model):
             raise ValidationError(
                 "INDIVIDUAL selection_strategy.source must be SELF."
             )
-    elif source != PRIMARY_WORKER_SOURCE:
+    elif source not in {PRIMARY_WORKER_SOURCE, HOUSEHOLD_HEAD_SOURCE}:
         raise ValidationError(
-            "GROUP selection_strategy.source must be PRIMARY_WORKER."
+            "GROUP selection_strategy.source must be PRIMARY_WORKER or "
+            "HOUSEHOLD_HEAD."
         )
 
+    if "quotas" in selection_strategy:
+        shorthand = SHORTHAND_QUOTA_KEYS & set(selection_strategy)
+        if shorthand:
+            raise ValidationError(
+                "enrolment_ranking.selection_strategy.quotas cannot be combined "
+                "with " + ", ".join(sorted(shorthand)) + "."
+            )
+        quotas = _normalise_quotas(selection_strategy["quotas"], source)
+    else:
+        quotas = _shorthand_quotas(selection_strategy)
+
+    return {"source": source, "quotas": quotas}
+
+
+def _shorthand_quotas(selection_strategy):
+    """Translate the female/youth shorthand into female then youth buckets."""
     female = selection_strategy.get("female_percentage", 0)
     youth = selection_strategy.get("youth_percentage", 0)
     for key, value in (
@@ -374,14 +443,161 @@ def _normalise_selection_strategy(selection_strategy, model):
             "with 0 <= minimum <= maximum <= 120."
         )
 
-    return {
-        "source": source,
-        "female_percentage": female,
-        "youth_percentage": youth,
-        "female_value": female_value,
-        "youth_min_age": youth_min,
-        "youth_max_age": youth_max,
+    return [
+        {
+            "key": "female",
+            "percentage": female,
+            "when": [{
+                "field": EnrolmentConfig.registry_gender_field,
+                "filter": "iexact",
+                "type": "string",
+                "value": female_value,
+            }],
+        },
+        {
+            "key": "youth",
+            "percentage": youth,
+            "when": [
+                {"derived": "age", "filter": "gte", "value": youth_min},
+                {"derived": "age", "filter": "lte", "value": youth_max},
+            ],
+        },
+    ]
+
+
+def _normalise_quotas(quotas, source):
+    path = "enrolment_ranking.selection_strategy.quotas"
+    if not isinstance(quotas, list) or not quotas:
+        raise ValidationError(f"{path} must be a non-empty list.")
+
+    normalised = []
+    keys = set()
+    total_percentage = 0
+    for index, quota in enumerate(quotas):
+        quota_path = f"{path}[{index}]"
+        if not isinstance(quota, dict):
+            raise ValidationError(f"{quota_path} must be an object.")
+        unexpected = set(quota) - {"key", "when", "percentage", "count"}
+        if unexpected:
+            raise ValidationError(
+                f"Unsupported {quota_path} keys: " + ", ".join(sorted(unexpected))
+            )
+
+        key = quota.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError(f"{quota_path}.key must be a non-empty string.")
+        if key in keys:
+            raise ValidationError(f"{path} key {key} is used more than once.")
+        keys.add(key)
+
+        if ("percentage" in quota) == ("count" in quota):
+            raise ValidationError(
+                f"{quota_path} must set exactly one of percentage or count."
+            )
+        bucket = {"key": key}
+        if "percentage" in quota:
+            percentage = quota["percentage"]
+            if not _is_number(percentage) or not 0 < percentage <= 100:
+                raise ValidationError(
+                    f"{quota_path}.percentage must be above 0 and at most 100."
+                )
+            total_percentage += percentage
+            bucket["percentage"] = percentage
+        else:
+            count = quota["count"]
+            if type(count) is not int or count < 1:
+                raise ValidationError(
+                    f"{quota_path}.count must be a positive integer."
+                )
+            bucket["count"] = count
+
+        conditions = quota.get("when")
+        if not isinstance(conditions, list) or not conditions:
+            raise ValidationError(f"{quota_path}.when must be a non-empty list.")
+        bucket["when"] = [
+            _normalise_quota_condition(
+                condition, f"{quota_path}.when[{condition_index}]", source
+            )
+            for condition_index, condition in enumerate(conditions)
+        ]
+        normalised.append(bucket)
+
+    if total_percentage > 100:
+        raise ValidationError(f"{path} percentages cannot exceed 100.")
+    return normalised
+
+
+def _normalise_quota_condition(condition, path, source):
+    if not isinstance(condition, dict):
+        raise ValidationError(f"{path} must be an object.")
+    unexpected = set(condition) - {
+        "subject", "field", "derived", "filter", "type", "value",
     }
+    if unexpected:
+        raise ValidationError(
+            f"Unsupported {path} keys: " + ", ".join(sorted(unexpected))
+        )
+
+    subject = condition.get("subject")
+    expected_subject = SOURCE_SUBJECTS[source]
+    if subject is not None and subject != expected_subject:
+        raise ValidationError(
+            f"{path}.subject must be {expected_subject} when the "
+            f"selection_strategy.source is {source}."
+        )
+    if ("field" in condition) == ("derived" in condition):
+        raise ValidationError(f"{path} must set exactly one of field or derived.")
+
+    if "derived" in condition:
+        derived = DERIVED_QUOTA_VALUES.get(condition["derived"])
+        if derived is None:
+            raise ValidationError(
+                f"{path}.derived {condition['derived']} is not supported; "
+                "supported values: " + ", ".join(sorted(DERIVED_QUOTA_VALUES)) + "."
+            )
+        normalise, _ = derived
+        return normalise(condition, path)
+
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    field = condition["field"]
+    if (
+        not isinstance(field, str)
+        or not field.strip()
+        or "__" in field
+        or "=" in field
+    ):
+        raise ValidationError(f"{path}.field must be a json_ext key.")
+    value_type = condition.get("type")
+    if value_type not in QUOTA_VALUE_TYPES:
+        raise ValidationError(
+            f"{path}.type must be one of "
+            + ", ".join(sorted(QUOTA_VALUE_TYPES)) + "."
+        )
+    if filter_name not in FILTERS_BY_TYPE[value_type]:
+        raise ValidationError(
+            f"{path}.filter {filter_name} is not allowed for {value_type}."
+        )
+    if not QUOTA_VALUE_TYPES[value_type](value):
+        raise ValidationError(f"{path}.value must be of type {value_type}.")
+    return {
+        "field": field,
+        "filter": filter_name,
+        "type": value_type,
+        "value": value,
+    }
+
+
+def _normalise_age_condition(condition, path):
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    if condition.get("type", "integer") != "integer":
+        raise ValidationError(f"{path}.type must be integer for age.")
+    if filter_name not in FILTERS_BY_TYPE["integer"]:
+        raise ValidationError(f"{path}.filter {filter_name} is not allowed for age.")
+    if type(value) is not int or not 0 <= value <= 120:
+        raise ValidationError(f"{path}.value must be an age from 0 to 120.")
+    return {"derived": "age", "filter": filter_name, "value": value}
 
 
 def validate_ranking_spec(ranking, model, beneficiary_schema=None):
@@ -432,7 +648,8 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         for index, item in enumerate(order_by)
     ]
     if weighted_score is not None and not any(
-        item["field"] == WEIGHTED_SCORE_FIELD for item in normalised
+        item["field"] == WEIGHTED_SCORE_FIELD and not item.get("subject")
+        for item in normalised
     ):
         raise ValidationError(
             "enrolment_ranking.order_by must include _weighted_score when "
@@ -441,7 +658,10 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
 
     tie_breaker = ranking.get("tie_breaker", "id")
     _validate_model_path(model, tie_breaker, schema_fields=schema_fields)
-    normalised = [item for item in normalised if item["field"] != tie_breaker]
+    normalised = [
+        item for item in normalised
+        if item.get("subject") or item["field"] != tie_breaker
+    ]
     normalised.append({"field": tie_breaker, "direction": "asc"})
 
     limit = ranking.get("limit", {})
@@ -619,40 +839,27 @@ def _age_range_dob(today, minimum_age, maximum_age):
     return earliest, latest
 
 
+def _household_member(source):
+    """Return the outer household's head or primary-worker membership."""
+    memberships = (
+        household_head_memberships()
+        if source == HOUSEHOLD_HEAD_SOURCE
+        else authoritative_primary_worker_memberships()
+    )
+    return memberships.filter(group_id=OuterRef("pk")).order_by("id")
+
+
 def _annotate_selection_source(queryset, source):
+    """Annotate the person whose attributes place a candidate in a quota."""
     if source == SELF_SOURCE:
         return queryset.annotate(
-            _selection_gender=KeyTextTransform(
-                EnrolmentConfig.registry_gender_field,
-                "json_ext",
-            ),
+            _selection_individual=F("id"),
             _selection_dob=F("dob"),
         )
 
-    from individual.models import GroupIndividual
-
-    if source == HOUSEHOLD_HEAD_SOURCE:
-        member = GroupIndividual.objects.filter(
-            group_id=OuterRef("pk"),
-            is_deleted=False,
-            group__is_deleted=False,
-            individual__is_deleted=False,
-            role=GroupIndividual.Role.HEAD,
-        ).order_by("id")
-    else:
-        member = authoritative_primary_worker_memberships().filter(
-            group_id=OuterRef("pk")
-        ).order_by("id")
-
-    gender = KeyTextTransform(
-        EnrolmentConfig.registry_gender_field,
-        "individual__json_ext",
-    )
+    member = _household_member(source)
     return queryset.annotate(
-        _selection_gender=Subquery(
-            member.annotate(_value=gender).values("_value")[:1],
-            output_field=CharField(),
-        ),
+        _selection_individual=Subquery(member.values("individual_id")[:1]),
         _selection_dob=Subquery(
             member.values("individual__dob")[:1],
             output_field=DateField(),
@@ -660,11 +867,61 @@ def _annotate_selection_source(queryset, source):
     )
 
 
+def _age_condition_q(dob_field, filter_name, age):
+    """Translate an age comparison into a date-of-birth range on ``dob_field``."""
+    today = date.today()
+    if filter_name == "gt":
+        filter_name, age = "gte", age + 1
+    elif filter_name == "lt":
+        filter_name, age = "lte", age - 1
+    if filter_name == "gte":
+        return Q(**{f"{dob_field}__lte": _years_ago_boundary(today, age)})
+    if filter_name == "lte":
+        return Q(**{f"{dob_field}__gte": _age_range_dob(today, 0, age)[0]})
+    return Q(**{f"{dob_field}__range": _age_range_dob(today, age, age)})
+
+
+def _age_quota_q(condition):
+    return _age_condition_q(
+        "_selection_dob", condition["filter"], condition["value"]
+    )
+
+
+# Derived values a quota condition may use: name -> (validate and normalise
+# the condition, build its filter on the annotated selection source).
+DERIVED_QUOTA_VALUES = {
+    "age": (_normalise_age_condition, _age_quota_q),
+}
+
+
+def _quota_q(conditions):
+    """Combine a quota's conditions on the selection source into one filter."""
+    from individual.models import Individual
+
+    query = Q()
+    field_conditions = []
+    for condition in conditions:
+        if "derived" in condition:
+            _, condition_q = DERIVED_QUOTA_VALUES[condition["derived"]]
+            query &= condition_q(condition)
+        else:
+            field_conditions.append(criterion_to_condition(condition))
+    if field_conditions:
+        matching = CustomFilterWizardStorage.build_custom_filters_queryset(
+            "individual",
+            "Individual",
+            field_conditions,
+            Individual.objects.filter(is_deleted=False),
+        )
+        query &= Q(_selection_individual__in=matching.values("id"))
+    return query
+
+
 def _select_quota_ids(ranked, selection_strategy, cap):
-    """Select female, then non-overlapping youth quotas, then ranked fallback.
+    """Fill quota buckets in order, then the remaining places from the ranked list.
 
     ``ranked`` already carries the configured weighted/deterministic ordering.
-    Each quota and the fallback retain that ordering, and exclusions ensure one
+    Each bucket and the fallback retain that ordering, and exclusions ensure one
     beneficiary cannot occupy more than one place.
     """
     strategy = _normalise_selection_strategy(
@@ -674,31 +931,21 @@ def _select_quota_ids(ranked, selection_strategy, cap):
     candidates = _annotate_selection_source(ranked, strategy["source"])
     selected_ids = []
 
-    female_target = math.floor(
-        cap * strategy["female_percentage"] / 100
-    )
-    if female_target:
-        selected_ids.extend(
-            candidates.filter(
-                _selection_gender__iexact=strategy["female_value"]
-            ).values_list("id", flat=True)[:female_target]
-        )
-
-    youth_target = math.floor(
-        cap * strategy["youth_percentage"] / 100
-    )
-    if youth_target:
-        earliest, latest = _age_range_dob(
-            date.today(),
-            strategy["youth_min_age"],
-            strategy["youth_max_age"],
-        )
+    for quota in strategy["quotas"]:
+        target = quota.get("count")
+        if target is None:
+            target = math.floor(cap * quota["percentage"] / 100)
+        target = min(target, cap - len(selected_ids))
+        if target <= 0:
+            continue
         selected_ids.extend(
             candidates.exclude(id__in=selected_ids).filter(
-                _selection_dob__range=(earliest, latest)
-            ).values_list("id", flat=True)[:youth_target]
+                _quota_q(quota["when"])
+            ).values_list("id", flat=True)[:target]
         )
 
+    # Places the buckets leave unfilled always go to the next ranked candidates,
+    # so the Phase reaches its target whenever enough candidates are eligible.
     remaining = cap - len(selected_ids)
     if remaining:
         selected_ids.extend(
@@ -732,7 +979,14 @@ def build_order_by(queryset, order_items):
         alias = f"_enrolment_rank_{index}"
         field_name = item["field"]
         expression = F(field_name)
-        if field_name.startswith("json_ext__"):
+        if item.get("subject"):
+            member = _household_member(MEMBER_SUBJECT_SOURCES[item["subject"]])
+            value = KeyTextTransform(field_name, "individual__json_ext")
+            expression = Subquery(
+                member.annotate(_order_value=value).values("_order_value")[:1],
+                output_field=CharField(),
+            )
+        elif field_name.startswith("json_ext__"):
             expression = KeyTextTransform.from_lookup(field_name)
         elif field_name != WEIGHTED_SCORE_FIELD:
             try:
@@ -758,9 +1012,15 @@ def build_order_by(queryset, order_items):
     return queryset.annotate(**annotations).order_by(*ordering)
 
 
+def _order_item_label(item):
+    if item.get("subject"):
+        return f"{item['subject']}.{item['field']}"
+    return item["field"]
+
+
 def _cast_error(order_items, exc, weighted_score=None):
     casts = ", ".join(
-        f"{item['field']} ({item['cast']})"
+        f"{_order_item_label(item)} ({item['cast']})"
         for item in order_items
         if item.get("cast")
     )

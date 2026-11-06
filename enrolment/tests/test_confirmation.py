@@ -65,7 +65,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
             },
         )
 
-    def _verified_group(self, token):
+    def _verified_group(self, token, individual_json_ext=None):
         individual, group, membership = create_group_with_individual(
             self.admin_user.username,
             group_override={
@@ -74,7 +74,10 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
                     "validation_status": "VERIFIED",
                 }
             },
-            individual_override={"json_ext": {"enrolment_test": token}},
+            individual_override={"json_ext": {
+                "enrolment_test": token,
+                **(individual_json_ext or {}),
+            }},
         )
         membership.json_ext = {"primary_worker": True}
         membership.save(username=self.admin_user.username)
@@ -569,6 +572,92 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
                 benefit_plan=plan, status="ACTIVE", is_deleted=False
             ).count(),
             5,
+        )
+
+    @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
+    def test_approval_keeps_places_filled_after_a_quota_shortfall(self):
+        token = "quota-shortfall-group"
+        plan = create_benefit_plan(
+            self.admin_user.username,
+            payload_override={
+                "type": "GROUP",
+                "max_beneficiaries": 4,
+                "beneficiary_data_schema": {
+                    "properties": {"enrolment_test": {"type": "string"}}
+                },
+                "json_ext": {
+                    "advanced_criteria": {
+                        "ACTIVE": [{
+                            "field": "enrolment_test",
+                            "filter": "exact",
+                            "type": "string",
+                            "value": token,
+                        }]
+                    },
+                    "enrolment_ranking": {
+                        "ACTIVE": {
+                            "order_by": ["id"],
+                            "selection_strategy": {
+                                "source": "PRIMARY_WORKER",
+                                "quotas": [{
+                                    "key": "female",
+                                    "percentage": 50,
+                                    "when": [{
+                                        "field": "gender",
+                                        "filter": "iexact",
+                                        "type": "string",
+                                        "value": "Female",
+                                    }],
+                                }],
+                            },
+                        }
+                    },
+                },
+            },
+        )
+        men = [
+            self._verified_group(token, {"gender": "Male"})[1]
+            for _ in range(4)
+        ]
+        _, woman, _ = self._verified_group(token, {"gender": "Female"})
+        # The female quota reserves 2 of the 4 places but has one candidate,
+        # so the spare place goes to the next ranked household. The last
+        # man misses out even though he ranks ahead of the woman by id.
+        expected = {woman.id, men[0].id, men[1].id, men[2].id}
+
+        preview = build_group_enrolment_selection(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        self.assertEqual(preview["will_enrol"], 4)
+        self.assertEqual(
+            set(
+                preview["groups_not_assigned_to_selected_programme"]
+                .values_list("id", flat=True)
+            ),
+            expected,
+        )
+
+        EnrolmentService(self.admin_user).select_groups_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(
+            set(
+                GroupBeneficiary.objects.filter(
+                    benefit_plan=plan, status="ACTIVE", is_deleted=False
+                ).values_list("group_id", flat=True)
+            ),
+            expected,
         )
 
     @patch.object(
