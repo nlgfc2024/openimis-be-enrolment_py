@@ -13,6 +13,15 @@ def active_household_memberships():
     )
 
 
+def household_head_memberships():
+    """Return active memberships whose role is household head."""
+    from individual.models import GroupIndividual
+
+    return active_household_memberships().filter(
+        role=GroupIndividual.Role.HEAD
+    )
+
+
 def authoritative_primary_worker_memberships():
     """Return active primary workers belonging to verified households."""
     primary_worker_lookup = (

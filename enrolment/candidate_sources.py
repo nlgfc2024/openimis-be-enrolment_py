@@ -11,6 +11,7 @@ from enrolment.membership import (
     active_household_memberships,
     primary_worker_membership_filter,
 )
+from enrolment.profiles import apply_profile_eligibility
 
 
 class IndividualCandidateSource:
@@ -44,6 +45,7 @@ class IndividualCandidateSource:
         query = query.annotate(
             _has_active_household_membership=Exists(active_membership)
         ).filter(_has_active_household_membership=False)
+        query = apply_profile_eligibility(query, benefit_plan, self.phase_type)
         return CustomFilterWizardStorage.build_custom_filters_queryset(
             "individual",
             "Individual",
@@ -94,6 +96,7 @@ class GroupCandidateSource:
             selection_context.update(
                 authorized_groups=authorized, enrolled_groups=enrolled_scope,
             )
+        query = apply_profile_eligibility(query, benefit_plan, self.phase_type)
         return CustomFilterWizardStorage.build_custom_filters_queryset(
             "individual",
             "Group",
