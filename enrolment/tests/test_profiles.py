@@ -5,6 +5,13 @@ from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 
 from individual.models import Group, Individual
+from individual.tests.test_helpers import (
+    IndividualGQLTestCase,
+    add_individual_to_group,
+    create_group,
+    create_individual,
+)
+from social_protection.tests.test_helpers import create_benefit_plan
 
 from enrolment.apps import DEFAULT_CONFIG, EnrolmentConfig
 from enrolment.profiles import (
@@ -12,6 +19,7 @@ from enrolment.profiles import (
     resolve_programme_profile,
     validate_programme_profiles,
 )
+from enrolment.services import build_group_enrolment_selection
 
 
 def _criterion(**overrides):
@@ -176,3 +184,125 @@ class ProgrammeProfileEligibilityTest(SimpleTestCase):
             self._apply(
                 [_criterion(subject="primary_worker")], Individual, "INDIVIDUAL"
             )
+
+
+class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
+    """Profiles applied to real registry records."""
+
+    def setUp(self):
+        for name, value in (
+            ("mandatory_enrollment_criteria", {"INDIVIDUAL": {}, "GROUP": {}}),
+            ("programme_profiles", {}),
+        ):
+            self.addCleanup(
+                setattr, EnrolmentConfig, name,
+                copy.deepcopy(getattr(EnrolmentConfig, name)),
+            )
+            setattr(EnrolmentConfig, name, value)
+
+    def _plan(self, token, criteria):
+        plan = create_benefit_plan(self.admin_user.username, payload_override={
+            "type": "GROUP",
+            "beneficiary_data_schema": {
+                "properties": {"enrolment_test": {"type": "string"}}
+            },
+            "json_ext": {"advanced_criteria": {"ACTIVE": [{
+                "field": "enrolment_test",
+                "filter": "exact",
+                "type": "string",
+                "value": token,
+            }]}},
+        })
+        self._set_profile(plan, criteria)
+        return plan
+
+    def _set_profile(self, plan, criteria):
+        EnrolmentConfig.programme_profiles = {
+            plan.code: {"eligibility": {"criteria": criteria}}
+        }
+
+    def _household(self, token, members, primary_worker=0):
+        """Create a VERIFIED household from members' json_ext; the first is head."""
+        username = self.admin_user.username
+        group = create_group(username, {"json_ext": {"enrolment_test": token}})
+        memberships = [
+            add_individual_to_group(
+                username,
+                create_individual(username, {
+                    "json_ext": {"enrolment_test": token, **json_ext},
+                }),
+                group,
+                is_head=index == 0,
+            )
+            for index, json_ext in enumerate(members)
+        ]
+        memberships[primary_worker].json_ext = {"primary_worker": True}
+        memberships[primary_worker].save(username=username)
+        # Saving a membership copies the head's json_ext onto the household
+        # and drops validation_status, so verify the household last.
+        group.refresh_from_db()
+        group.json_ext = {
+            **(group.json_ext or {}),
+            "enrolment_test": token,
+            "validation_status": "VERIFIED",
+        }
+        group.save(username=username)
+        return group
+
+    def _eligible(self, plan):
+        selection = build_group_enrolment_selection(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        return set(
+            selection["groups_not_assigned_to_selected_programme"]
+            .values_list("id", flat=True)
+        )
+
+    def test_rmep_profile_reads_the_primary_worker(self):
+        token = "profile-rmep"
+        plan = self._plan(token, [
+            _criterion(subject="household"),
+            _criterion(
+                subject="primary_worker",
+                field="business_experience",
+                value="Yes",
+            ),
+        ])
+        # The head's answer is the opposite of the primary worker's in both
+        # households, so only a criterion that reads the primary worker
+        # selects the first one.
+        experienced = self._household(
+            token,
+            [{"business_experience": "No"}, {"business_experience": "Yes"}],
+            primary_worker=1,
+        )
+        self._household(
+            token,
+            [{"business_experience": "Yes"}, {"business_experience": "No"}],
+            primary_worker=1,
+        )
+
+        self.assertEqual(self._eligible(plan), {experienced.id})
+
+    def test_any_member_criteria_must_be_met_by_one_member(self):
+        token = "profile-any-member"
+        plan = self._plan(token, [
+            _criterion(
+                subject="any_member", field="savings_experience", value="Yes",
+            ),
+            _criterion(
+                subject="any_member",
+                field="willingness_to_participate",
+                value="Yes",
+            ),
+        ])
+        one_member = self._household(token, [
+            {},
+            {"savings_experience": "Yes", "willingness_to_participate": "Yes"},
+        ])
+        self._household(token, [
+            {"savings_experience": "Yes"},
+            {"willingness_to_participate": "Yes"},
+        ])
+
+        self.assertEqual(self._eligible(plan), {one_member.id})
