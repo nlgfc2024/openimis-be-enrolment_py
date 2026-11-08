@@ -23,7 +23,12 @@ from django.db.models.functions import Cast
 
 from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
-from enrolment.criteria import FILTERS_BY_TYPE, criterion_to_condition
+from enrolment.criteria import (
+    FILTERS_BY_TYPE,
+    VALUE_TYPES,
+    criterion_to_condition,
+    is_number,
+)
 from enrolment.membership import (
     authoritative_primary_worker_memberships,
     household_head_memberships,
@@ -58,15 +63,6 @@ SHORTHAND_QUOTA_KEYS = {
     "female_value",
     "youth_min_age",
     "youth_max_age",
-}
-# Value types the Individual custom filter wizard can cast for quota conditions.
-# This duplicates the type list behind criteria.FILTERS_BY_TYPE; change C12 in
-# the enrolment requirements assessment merges them into one shared list.
-QUOTA_VALUE_TYPES = {
-    "string": lambda value: isinstance(value, str),
-    "integer": lambda value: type(value) is int,
-    "numeric": lambda value: _is_number(value),
-    "boolean": lambda value: isinstance(value, bool),
 }
 
 
@@ -179,16 +175,8 @@ def _normalise_order_item(
     return result
 
 
-def _is_number(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
-
-
 def _positive_number(value, path):
-    if not _is_number(value) or value <= 0:
+    if not is_number(value) or value <= 0:
         raise ValidationError(f"{path} must be a positive number.")
 
 
@@ -233,13 +221,13 @@ def _validate_scoring(scoring, path):
         if not isinstance(values, dict) or not values:
             raise ValidationError(f"{path}.values must be a non-empty object.")
         if not all(
-            isinstance(key, str) and _is_number(points)
+            isinstance(key, str) and is_number(points)
             for key, points in values.items()
         ):
             raise ValidationError(
                 f"{path}.values must map strings to numeric points."
             )
-        if not _is_number(scoring.get("default", 0)):
+        if not is_number(scoring.get("default", 0)):
             raise ValidationError(f"{path}.default must be numeric.")
         maximum_points = scoring.get(
             "maximum_points",
@@ -268,14 +256,14 @@ def _validate_scoring(scoring, path):
                     f"Unsupported {band_path} keys: "
                     f"{', '.join(sorted(unexpected_band))}."
                 )
-            if "points" not in band or not _is_number(band["points"]):
+            if "points" not in band or not is_number(band["points"]):
                 raise ValidationError(f"{band_path}.points must be numeric.")
             if "min" not in band and "max" not in band:
                 raise ValidationError(
                     f"{band_path} must define min, max, or both."
                 )
             for bound in ("min", "max"):
-                if bound in band and not _is_number(band[bound]):
+                if bound in band and not is_number(band[bound]):
                     raise ValidationError(f"{band_path}.{bound} must be numeric.")
             if (
                 "min" in band
@@ -284,7 +272,7 @@ def _validate_scoring(scoring, path):
             ):
                 raise ValidationError(f"{band_path}.min cannot exceed max.")
             points.append(band["points"])
-        if not _is_number(scoring.get("default", 0)):
+        if not is_number(scoring.get("default", 0)):
             raise ValidationError(f"{path}.default must be numeric.")
         maximum_points = scoring.get(
             "maximum_points",
@@ -497,7 +485,7 @@ def _normalise_quotas(quotas, source):
         bucket = {"key": key}
         if "percentage" in quota:
             percentage = quota["percentage"]
-            if not _is_number(percentage) or not 0 < percentage <= 100:
+            if not is_number(percentage) or not 0 < percentage <= 100:
                 raise ValidationError(
                     f"{quota_path}.percentage must be above 0 and at most 100."
                 )
@@ -569,16 +557,16 @@ def _normalise_quota_condition(condition, path, source):
     ):
         raise ValidationError(f"{path}.field must be a json_ext key.")
     value_type = condition.get("type")
-    if value_type not in QUOTA_VALUE_TYPES:
+    if value_type not in VALUE_TYPES:
         raise ValidationError(
             f"{path}.type must be one of "
-            + ", ".join(sorted(QUOTA_VALUE_TYPES)) + "."
+            + ", ".join(sorted(VALUE_TYPES)) + "."
         )
     if filter_name not in FILTERS_BY_TYPE[value_type]:
         raise ValidationError(
             f"{path}.filter {filter_name} is not allowed for {value_type}."
         )
-    if not QUOTA_VALUE_TYPES[value_type](value):
+    if not VALUE_TYPES[value_type](value):
         raise ValidationError(f"{path}.value must be of type {value_type}.")
     return {
         "field": field,
