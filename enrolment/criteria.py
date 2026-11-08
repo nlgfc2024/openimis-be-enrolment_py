@@ -1,4 +1,5 @@
 import json
+import math
 
 from django.apps import apps
 from django.core.exceptions import ValidationError
@@ -18,6 +19,26 @@ FILTERS_BY_TYPE = {
     "numeric": {"exact", "lt", "lte", "gt", "gte"},
     "date": {"exact", "lt", "lte", "gt", "gte"},
     "boolean": {"exact"},
+}
+
+
+def is_number(value):
+    """Return whether ``value`` is a finite int or float, excluding booleans."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+# Value types a configured condition (a profile criterion or a quota condition)
+# may use: those the individual module's custom filter wizards can cast. Each
+# maps to a check on the configured value; FILTERS_BY_TYPE gives the filters.
+VALUE_TYPES = {
+    "string": lambda value: isinstance(value, str),
+    "integer": lambda value: type(value) is int,
+    "numeric": is_number,
+    "boolean": lambda value: isinstance(value, bool),
 }
 
 

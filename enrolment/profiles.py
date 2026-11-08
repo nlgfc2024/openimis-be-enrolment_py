@@ -10,13 +10,12 @@ from django.db.models import Exists, OuterRef
 from core.custom_filters import CustomFilterWizardStorage
 
 from enrolment.apps import EnrolmentConfig
-from enrolment.criteria import FILTERS_BY_TYPE, criterion_to_condition
+from enrolment.criteria import FILTERS_BY_TYPE, VALUE_TYPES, criterion_to_condition
 from enrolment.membership import (
     active_household_memberships,
     authoritative_primary_worker_memberships,
     household_head_memberships,
 )
-from enrolment.ranking import _is_number
 
 
 DEFAULT_PROFILE = "default"
@@ -34,14 +33,6 @@ MEMBER_SUBJECTS = {
 # The ranking module keeps matching subject names for order_by and quotas;
 # change C12 in the enrolment requirements assessment merges them into one list.
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
-# Value types the individual module's custom filter wizards can cast. This
-# duplicates the type list behind criteria.FILTERS_BY_TYPE; C12 merges them.
-VALUE_TYPES = {
-    "string": lambda value: isinstance(value, str),
-    "integer": lambda value: type(value) is int,
-    "numeric": _is_number,
-    "boolean": lambda value: isinstance(value, bool),
-}
 
 
 def validate_programme_profiles(profiles):
