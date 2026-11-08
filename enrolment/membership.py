@@ -38,6 +38,23 @@ def authoritative_primary_worker_memberships():
     )
 
 
+# Subject names shared by profile criteria, order_by items and quota
+# conditions. household and self name the candidate record itself.
+SELF_SUBJECT = "self"
+HOUSEHOLD_SUBJECT = "household"
+HEAD_SUBJECT = "head"
+PRIMARY_WORKER_SUBJECT = "primary_worker"
+ANY_MEMBER_SUBJECT = "any_member"
+# The subject that names the candidate record, by Phase type.
+CANDIDATE_SUBJECTS = {"GROUP": HOUSEHOLD_SUBJECT, "INDIVIDUAL": SELF_SUBJECT}
+# Household members a GROUP subject reads, with the memberships that hold them.
+MEMBER_SUBJECTS = {
+    PRIMARY_WORKER_SUBJECT: authoritative_primary_worker_memberships,
+    HEAD_SUBJECT: household_head_memberships,
+    ANY_MEMBER_SUBJECT: active_household_memberships,
+}
+
+
 def primary_worker_membership_filter(prefix="groupindividuals"):
     """Build the equivalent relation filter for Group queryset annotations."""
     return Q(

@@ -30,8 +30,11 @@ from enrolment.criteria import (
     is_number,
 )
 from enrolment.membership import (
+    HEAD_SUBJECT,
+    MEMBER_SUBJECTS,
+    PRIMARY_WORKER_SUBJECT,
+    SELF_SUBJECT,
     authoritative_primary_worker_memberships,
-    household_head_memberships,
 )
 
 
@@ -47,16 +50,15 @@ WEIGHTED_SCORE_FIELD = "_weighted_score"
 PRIMARY_WORKER_SOURCE = "PRIMARY_WORKER"
 HOUSEHOLD_HEAD_SOURCE = "HOUSEHOLD_HEAD"
 SELF_SOURCE = "SELF"
+# The subject each selection_strategy.source names.
 SOURCE_SUBJECTS = {
-    SELF_SOURCE: "self",
-    PRIMARY_WORKER_SOURCE: "primary_worker",
-    HOUSEHOLD_HEAD_SOURCE: "head",
+    SELF_SOURCE: SELF_SUBJECT,
+    PRIMARY_WORKER_SOURCE: PRIMARY_WORKER_SUBJECT,
+    HOUSEHOLD_HEAD_SOURCE: HEAD_SUBJECT,
 }
-# Household members whose json_ext a GROUP order_by item may read.
-MEMBER_SUBJECT_SOURCES = {
-    SOURCE_SUBJECTS[HOUSEHOLD_HEAD_SOURCE]: HOUSEHOLD_HEAD_SOURCE,
-    SOURCE_SUBJECTS[PRIMARY_WORKER_SOURCE]: PRIMARY_WORKER_SOURCE,
-}
+# Household members whose json_ext a GROUP order_by item may read. A sort needs
+# one value per household, so any_member waits for a best-member aggregate.
+ORDER_BY_MEMBER_SUBJECTS = {HEAD_SUBJECT, PRIMARY_WORKER_SUBJECT}
 SHORTHAND_QUOTA_KEYS = {
     "female_percentage",
     "youth_percentage",
@@ -137,13 +139,13 @@ def _normalise_order_item(
 
     subject = result.pop("subject", None)
     if model._meta.model_name == "individual":
-        if subject not in {None, SOURCE_SUBJECTS[SELF_SOURCE]}:
+        if subject not in {None, SELF_SUBJECT}:
             raise ValidationError(
                 f"INDIVIDUAL enrolment_ranking.order_by[{index}].subject "
                 "must be self."
             )
         subject = None
-    elif subject is not None and subject not in MEMBER_SUBJECT_SOURCES:
+    elif subject is not None and subject not in ORDER_BY_MEMBER_SUBJECTS:
         raise ValidationError(
             f"GROUP enrolment_ranking.order_by[{index}].subject must be "
             "head or primary_worker."
@@ -827,14 +829,11 @@ def _age_range_dob(today, minimum_age, maximum_age):
     return earliest, latest
 
 
-def _household_member(source):
-    """Return the outer household's head or primary-worker membership."""
-    memberships = (
-        household_head_memberships()
-        if source == HOUSEHOLD_HEAD_SOURCE
-        else authoritative_primary_worker_memberships()
-    )
-    return memberships.filter(group_id=OuterRef("pk")).order_by("id")
+def _household_member(subject):
+    """Return the outer household's membership for a member ``subject``."""
+    return MEMBER_SUBJECTS[subject]().filter(
+        group_id=OuterRef("pk")
+    ).order_by("id")
 
 
 def _annotate_selection_source(queryset, source):
@@ -845,7 +844,7 @@ def _annotate_selection_source(queryset, source):
             _selection_dob=F("dob"),
         )
 
-    member = _household_member(source)
+    member = _household_member(SOURCE_SUBJECTS[source])
     return queryset.annotate(
         _selection_individual=Subquery(member.values("individual_id")[:1]),
         _selection_dob=Subquery(
@@ -968,7 +967,7 @@ def build_order_by(queryset, order_items):
         field_name = item["field"]
         expression = F(field_name)
         if item.get("subject"):
-            member = _household_member(MEMBER_SUBJECT_SOURCES[item["subject"]])
+            member = _household_member(item["subject"])
             value = KeyTextTransform(field_name, "individual__json_ext")
             expression = Subquery(
                 member.annotate(_order_value=value).values("_order_value")[:1],

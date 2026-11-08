@@ -11,27 +11,13 @@ from core.custom_filters import CustomFilterWizardStorage
 
 from enrolment.apps import EnrolmentConfig
 from enrolment.criteria import FILTERS_BY_TYPE, VALUE_TYPES, criterion_to_condition
-from enrolment.membership import (
-    active_household_memberships,
-    authoritative_primary_worker_memberships,
-    household_head_memberships,
-)
+from enrolment.membership import CANDIDATE_SUBJECTS, MEMBER_SUBJECTS
 
 
 DEFAULT_PROFILE = "default"
 PROFILE_KEYS = {"description", "eligibility"}
 ELIGIBILITY_KEYS = {"criteria"}
 CRITERION_KEYS = {"subject", "field", "filter", "type", "value"}
-# Subjects that name the candidate record itself, by Phase type.
-CANDIDATE_SUBJECTS = {"GROUP": "household", "INDIVIDUAL": "self"}
-# Household members a GROUP criterion may read, by subject.
-MEMBER_SUBJECTS = {
-    "primary_worker": authoritative_primary_worker_memberships,
-    "head": household_head_memberships,
-    "any_member": active_household_memberships,
-}
-# The ranking module keeps matching subject names for order_by and quotas;
-# change C12 in the enrolment requirements assessment merges them into one list.
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
 
 
