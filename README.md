@@ -8,7 +8,6 @@ and Phase/beneficiary records remain in `social_protection`.
 
 The module accepts the following `MODULE_CONFIGURATION` keys:
 
-- `mandatory_enrollment_criteria`: criteria that every candidate must satisfy.
 - `enable_maker_checker_logic_enrollment`: stage confirmations for approval.
 - `default_beneficiary_status`: status assigned to newly enrolled beneficiaries.
 - `registry_gender_field`, `registry_primary_worker_field`,
@@ -26,6 +25,13 @@ The module accepts the following `MODULE_CONFIGURATION` keys:
 
 The individual and group maker-checker validation event names can be overridden
 with `validation_enrollment` and `validation_group_enrollment`.
+
+`mandatory_enrollment_criteria` is retired; programme profiles replace it. A
+configuration that still sets criteria under it is rejected on save, and one
+already stored is logged on load, because those criteria are no longer applied.
+Move them to a profile's `eligibility.criteria`, or to a Phase's
+`advanced_criteria` for a single beneficiary status. The empty
+`{"INDIVIDUAL": {}, "GROUP": {}}` shape is still accepted.
 
 ## Programme profiles
 
@@ -69,9 +75,8 @@ Phases' codes instead.
   A Phase without one uses `ubr`, which also matches untagged records. On an
   instance with several programmes, set it on each Phase (for example `pwp` for
   RMEP and `sctp` for UPG).
-- The profile's criteria are combined with the Phase's `advanced_criteria`, the
-  mandatory criteria and the operator's filters. A candidate must meet all of
-  them.
+- The profile's criteria are combined with the Phase's `advanced_criteria` and
+  the operator's filters. A candidate must meet all of them.
 - A criterion is a `json_ext` `field` with `filter`, `type` (`string`,
   `integer`, `numeric` or `boolean`) and `value`. `subject` names the record it
   reads. Without a `subject`, the criterion reads the candidate itself.
