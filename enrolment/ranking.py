@@ -1044,6 +1044,11 @@ def rank_and_cap_queryset(
     during confirmation without disabling the remaining capacity limit.
     """
     ranking = load_ranking_spec(benefit_plan, status)
+    if ranking is None:
+        # A Phase's own ranking replaces its programme profile's.
+        from enrolment.profiles import profile_ranking_spec
+
+        ranking = profile_ranking_spec(benefit_plan, status)
     pool_size = queryset.count()
     if ranking is None:
         return queryset, {

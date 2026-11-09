@@ -53,7 +53,7 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
             ([], "must be an object keyed by BenefitPlan code"),
             ({"RMEP": {}, "rmep": {}}, "differs only in case"),
             ({"RMEP": []}, "programme_profiles.RMEP must be an object"),
-            ({"RMEP": {"ranking": {}}}, "Unsupported programme_profiles.RMEP keys: ranking"),
+            ({"RMEP": {"phase_type": "GROUP"}}, "Unsupported programme_profiles.RMEP keys: phase_type"),
             ({"RMEP": {"description": 1}}, "description must be a string"),
             ({"RMEP": {"eligibility": []}}, "eligibility must be an object"),
             (
@@ -105,9 +105,46 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
             "INDIVIDUAL Phases: eligibility.criteria[0] uses subject household."
         ])
 
+    def test_profile_rankings_are_validated_for_the_phase_types_they_suit(self):
+        head_pmt = {"order_by": [{
+            "subject": "head", "field": "household_pmt_score", "cast": "float",
+        }]}
+        self_quota = {"selection_strategy": {
+            "source": "SELF", "female_percentage": 50, "youth_percentage": 0,
+        }}
+        self.assertEqual(validate_programme_profiles({
+            "PWP": {"ranking": {"*": head_pmt}},
+            "UMEP": {"ranking": {"ACTIVE": self_quota}},
+        }), [])
+
+        cases = [
+            (
+                {"ranking": {"SOMETIME": head_pmt}},
+                "programme_profiles.RMEP: ranking has unsupported status SOMETIME.",
+            ),
+            (
+                {"ranking": {"*": {"order_by": [], "sort": "desc"}}},
+                "programme_profiles.RMEP: ranking.*: Unsupported enrolment_ranking keys: sort.",
+            ),
+            (
+                {
+                    "eligibility": {"criteria": [_criterion(subject="self")]},
+                    "ranking": {"*": head_pmt},
+                },
+                "programme_profiles.RMEP suits neither Phase type. GROUP Phases: "
+                "eligibility.criteria[0] uses subject self. INDIVIDUAL Phases: "
+                "ranking.*: INDIVIDUAL enrolment_ranking.order_by[0].subject must be self.",
+            ),
+        ]
+        for profile, message in cases:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    validate_programme_profiles({"RMEP": profile}), [message]
+                )
+
     def test_module_config_rejects_invalid_profiles(self):
         config = copy.deepcopy(DEFAULT_CONFIG)
-        config["programme_profiles"] = {"RMEP": {"ranking": {}}}
+        config["programme_profiles"] = {"RMEP": {"phase_type": "GROUP"}}
         with self.assertRaisesMessage(ValidationError, "Unsupported programme_profiles"):
             EnrolmentConfig._validate_config(config)
 
@@ -221,26 +258,31 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
             )
             setattr(EnrolmentConfig, name, value)
 
-    def _plan(self, token, criteria):
+    def _plan(self, token, criteria, ranking=None, phase_ranking=None, **payload):
+        json_ext = {"advanced_criteria": {"ACTIVE": [{
+            "field": "enrolment_test",
+            "filter": "exact",
+            "type": "string",
+            "value": token,
+        }]}}
+        if phase_ranking is not None:
+            json_ext["enrolment_ranking"] = {"ACTIVE": phase_ranking}
         plan = create_benefit_plan(self.admin_user.username, payload_override={
             "type": "GROUP",
             "beneficiary_data_schema": {
                 "properties": {"enrolment_test": {"type": "string"}}
             },
-            "json_ext": {"advanced_criteria": {"ACTIVE": [{
-                "field": "enrolment_test",
-                "filter": "exact",
-                "type": "string",
-                "value": token,
-            }]}},
+            "json_ext": json_ext,
+            **payload,
         })
-        self._set_profile(plan, criteria)
+        self._set_profile(plan, criteria, ranking)
         return plan
 
-    def _set_profile(self, plan, criteria):
-        EnrolmentConfig.programme_profiles = {
-            plan.code: {"eligibility": {"criteria": criteria}}
-        }
+    def _set_profile(self, plan, criteria, ranking=None):
+        profile = {"eligibility": {"criteria": criteria}}
+        if ranking is not None:
+            profile["ranking"] = {"*": ranking}
+        EnrolmentConfig.programme_profiles = {plan.code: profile}
 
     def _household(self, token, members, primary_worker=0):
         """Create a VERIFIED household from members' json_ext; the first is head."""
@@ -327,6 +369,36 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
         ])
 
         self.assertEqual(self._eligible(plan), {one_member.id})
+
+    def _households_by_head_pmt(self, token):
+        richer = self._household(token, [{"household_pmt_score": 30}])
+        poorer = self._household(token, [{"household_pmt_score": 10}])
+        return richer, poorer
+
+    def test_profile_ranking_applies_when_the_phase_has_none(self):
+        token = "profile-ranking"
+        plan = self._plan(token, [], ranking={"order_by": [{
+            "subject": "head", "field": "household_pmt_score", "cast": "float",
+        }]}, max_beneficiaries=1)
+        _, poorer = self._households_by_head_pmt(token)
+
+        # Lowest PMT first, so the household created second takes the place.
+        self.assertEqual(self._eligible(plan), {poorer.id})
+
+    def test_phase_ranking_replaces_the_profile_ranking(self):
+        token = "phase-ranking"
+        plan = self._plan(
+            token,
+            [],
+            ranking={"order_by": [{
+                "subject": "head", "field": "household_pmt_score", "cast": "float",
+            }]},
+            phase_ranking={"order_by": ["id"]},
+            max_beneficiaries=1,
+        )
+        richer, _ = self._households_by_head_pmt(token)
+
+        self.assertEqual(self._eligible(plan), {richer.id})
 
     @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
     def test_approval_rechecks_a_profile_changed_after_confirmation(self):

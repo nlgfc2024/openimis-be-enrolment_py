@@ -16,10 +16,11 @@ from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
 from enrolment.criteria import FILTERS_BY_TYPE, VALUE_TYPES, criterion_to_condition
 from enrolment.membership import CANDIDATE_SUBJECTS, MEMBER_SUBJECTS
+from enrolment.ranking import ranking_errors
 
 
 DEFAULT_PROFILE = "default"
-PROFILE_KEYS = {"description", "eligibility"}
+PROFILE_KEYS = {"description", "eligibility", "ranking"}
 ELIGIBILITY_KEYS = {"criteria"}
 CRITERION_KEYS = {"subject", "field", "filter", "type", "value"}
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
@@ -69,14 +70,26 @@ def _unsuitable_profile_errors(profile, path):
     }
     if not all(reasons.values()):
         return []
+    if reasons["GROUP"] == reasons["INDIVIDUAL"]:
+        return [f"{path}: {_sentence(reasons['GROUP'])}"]
     return [f"{path} suits neither Phase type. " + " ".join(
-        f"{phase_type} Phases: " + "; ".join(errors) + "."
+        f"{phase_type} Phases: {_sentence(errors)}"
         for phase_type, errors in reasons.items()
     )]
 
 
+def _sentence(errors):
+    return "; ".join(error.rstrip(".") for error in errors) + "."
+
+
 def phase_type_errors(profile, phase_type):
-    """Return why Phases of ``phase_type`` cannot use ``profile``."""
+    """Return why Phases of ``phase_type`` cannot use ``profile``.
+
+    Rankings are checked without a Phase's beneficiary_data_schema, which only
+    enrolment has; it re-checks them against the Phase's schema.
+    """
+    from individual.models import Group, Individual
+
     subjects = {CANDIDATE_SUBJECTS[phase_type]}
     if phase_type == "GROUP":
         subjects |= set(MEMBER_SUBJECTS)
@@ -86,6 +99,9 @@ def phase_type_errors(profile, phase_type):
         subject = criterion.get("subject")
         if subject is not None and subject not in subjects:
             errors.append(f"eligibility.criteria[{index}] uses subject {subject}")
+    if "ranking" in profile:
+        model = Group if phase_type == "GROUP" else Individual
+        errors.extend(ranking_errors(profile["ranking"], model, path="ranking"))
     return errors
 
 
@@ -144,6 +160,13 @@ def resolve_programme_profile(benefit_plan):
     return None, None
 
 
+def profile_ranking_spec(benefit_plan, status):
+    """Return the Phase's profile ranking for ``status`` (or ``*``), if any."""
+    _, profile = resolve_programme_profile(benefit_plan)
+    rankings = (profile or {}).get("ranking") or {}
+    return rankings.get(status, rankings.get("*"))
+
+
 def apply_profile_eligibility(queryset, benefit_plan, phase_type):
     """Restrict candidates to the eligibility rules of the Phase's profile."""
     key, profile = resolve_programme_profile(benefit_plan)
@@ -153,7 +176,7 @@ def apply_profile_eligibility(queryset, benefit_plan, phase_type):
     if errors:
         raise ValidationError(
             f"Programme profile {key} cannot be used by {phase_type} Phases: "
-            + "; ".join(errors) + "."
+            + _sentence(errors)
         )
     eligibility = profile.get("eligibility") or {}
     candidate_subject = CANDIDATE_SUBJECTS[phase_type]
