@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 from datetime import date, timedelta
 
@@ -37,6 +38,7 @@ from enrolment.membership import (
     authoritative_primary_worker_memberships,
 )
 
+logger = logging.getLogger(__name__)
 
 SUPPORTED_CASTS = {
     "int": IntegerField,
@@ -47,6 +49,12 @@ SUPPORTED_CASTS = {
 SUPPORTED_DIRECTIONS = {"asc", "desc"}
 SUPPORTED_NULLS = {"first", "last"}
 WEIGHTED_SCORE_FIELD = "_weighted_score"
+# Rankings come from programme profiles only; a Phase can no longer hold one.
+RETIRED_PHASE_RANKING_MESSAGE = (
+    "Set the ranking in the programme profile instead "
+    "(programme_profiles.<Phase code or default>.ranking in the enrolment "
+    "module configuration) and remove enrolment_ranking from the Phase."
+)
 PRIMARY_WORKER_SOURCE = "PRIMARY_WORKER"
 HOUSEHOLD_HEAD_SOURCE = "HOUSEHOLD_HEAD"
 SELF_SOURCE = "SELF"
@@ -68,28 +76,14 @@ SHORTHAND_QUOTA_KEYS = {
 }
 
 
-def load_ranking_spec(benefit_plan, status):
-    """Return the status-specific ranking configuration stored on a Phase."""
-    json_ext = benefit_plan.json_ext or {}
+def holds_phase_ranking(json_ext):
+    """Whether a Phase's json_ext still sets the retired enrolment_ranking."""
     if isinstance(json_ext, str):
         try:
             json_ext = json.loads(json_ext)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("BenefitPlan json_ext must be valid JSON.") from exc
-    if not isinstance(json_ext, dict):
-        raise ValidationError("BenefitPlan json_ext must be an object.")
-
-    rankings = json_ext.get("enrolment_ranking")
-    if rankings is None:
-        return None
-    if not isinstance(rankings, dict):
-        raise ValidationError("enrolment_ranking must be an object keyed by beneficiary status.")
-    ranking = rankings.get(status, rankings.get("*"))
-    if ranking is None:
-        return None
-    if not isinstance(ranking, dict):
-        raise ValidationError(f"enrolment_ranking.{status} must be an object.")
-    return ranking
+        except (TypeError, ValueError):
+            return False
+    return isinstance(json_ext, dict) and bool(json_ext.get("enrolment_ranking"))
 
 
 def _validate_model_path(model, path, extra_fields=None, schema_fields=None):
@@ -686,33 +680,19 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
 
 
 def benefit_plan_ranking_validation_errors(data, existing=None):
-    """Shared Social Protection validator-registry callback."""
-    from individual.models import Group, Individual
-    from social_protection.models import BenefitPlan
+    """Shared Social Protection validator-registry callback.
 
-    if existing is not None and not hasattr(existing, "json_ext"):
-        existing = BenefitPlan.objects.filter(id=existing).first()
-
-    json_ext = data.get("json_ext")
-    if json_ext is None and existing is not None:
-        json_ext = existing.json_ext
-    if isinstance(json_ext, str):
-        try:
-            json_ext = json.loads(json_ext)
-        except (TypeError, ValueError):
-            return []  # Social Protection owns base json_ext validation.
-    if not isinstance(json_ext, dict) or "enrolment_ranking" not in json_ext:
+    Rankings belong in programme profiles, so reject a Phase update that sets
+    enrolment_ranking. Only the json_ext being saved is checked: an update that
+    leaves json_ext out is not blocked by a ranking stored earlier. An empty
+    enrolment_ranking, which the Phase form sends to clear it, is accepted.
+    """
+    if not holds_phase_ranking(data.get("json_ext")):
         return []
-
-    plan_type = data.get("type") or getattr(existing, "type", "INDIVIDUAL")
-    model = Group if plan_type == "GROUP" else Individual
-    schema = data.get("beneficiary_data_schema")
-    if schema is None and existing is not None:
-        schema = existing.beneficiary_data_schema
-    return [
-        {"message": message}
-        for message in ranking_errors(json_ext["enrolment_ranking"], model, schema)
-    ]
+    return [{
+        "message": "A Phase can no longer have an enrolment_ranking. "
+        + RETIRED_PHASE_RANKING_MESSAGE
+    }]
 
 
 def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ranking"):
@@ -1043,12 +1023,14 @@ def rank_and_cap_queryset(
     Approval revalidation can disable the percentage limit after it was applied
     during confirmation without disabling the remaining capacity limit.
     """
-    ranking = load_ranking_spec(benefit_plan, status)
-    if ranking is None:
-        # A Phase's own ranking replaces its programme profile's.
-        from enrolment.profiles import profile_ranking_spec
+    from enrolment.profiles import profile_ranking_spec
 
-        ranking = profile_ranking_spec(benefit_plan, status)
+    if holds_phase_ranking(benefit_plan.json_ext):
+        logger.warning(
+            "Phase %s still has an enrolment_ranking, which is no longer "
+            "applied. %s", benefit_plan.code, RETIRED_PHASE_RANKING_MESSAGE,
+        )
+    ranking = profile_ranking_spec(benefit_plan, status)
     pool_size = queryset.count()
     if ranking is None:
         return queryset, {
@@ -1141,5 +1123,4 @@ def rank_and_cap_queryset(
 
 
 # British-spelling compatibility for callers introduced during development.
-load_enrolment_ranking = load_ranking_spec
 validate_and_normalise_ranking = validate_ranking_spec
