@@ -688,7 +688,7 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
 def benefit_plan_ranking_validation_errors(data, existing=None):
     """Shared Social Protection validator-registry callback."""
     from individual.models import Group, Individual
-    from social_protection.models import BeneficiaryStatus, BenefitPlan
+    from social_protection.models import BenefitPlan
 
     if existing is not None and not hasattr(existing, "json_ext"):
         existing = BenefitPlan.objects.filter(id=existing).first()
@@ -703,33 +703,37 @@ def benefit_plan_ranking_validation_errors(data, existing=None):
             return []  # Social Protection owns base json_ext validation.
     if not isinstance(json_ext, dict) or "enrolment_ranking" not in json_ext:
         return []
-    rankings = json_ext["enrolment_ranking"]
-    if not isinstance(rankings, dict):
-        return [{"message": "enrolment_ranking must be an object."}]
 
     plan_type = data.get("type") or getattr(existing, "type", "INDIVIDUAL")
     model = Group if plan_type == "GROUP" else Individual
     schema = data.get("beneficiary_data_schema")
     if schema is None and existing is not None:
         schema = existing.beneficiary_data_schema
+    return [
+        {"message": message}
+        for message in ranking_errors(json_ext["enrolment_ranking"], model, schema)
+    ]
+
+
+def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ranking"):
+    """Return the errors in rankings keyed by beneficiary status (or ``*``)."""
+    from social_protection.models import BeneficiaryStatus
+
+    if not isinstance(rankings, dict):
+        return [f"{path} must be an object."]
     errors = []
     supported_statuses = set(BeneficiaryStatus.values) | {"*"}
     for status, ranking in rankings.items():
         if not isinstance(status, str) or not status:
-            errors.append({"message": "enrolment_ranking status keys must be strings."})
+            errors.append(f"{path} status keys must be strings.")
             continue
         if status not in supported_statuses:
-            errors.append({
-                "message": f"enrolment_ranking has unsupported status {status}."
-            })
+            errors.append(f"{path} has unsupported status {status}.")
             continue
         try:
-            validate_ranking_spec(ranking, model, schema)
+            validate_ranking_spec(ranking, model, beneficiary_schema)
         except ValidationError as exc:
-            errors.extend(
-                {"message": f"enrolment_ranking.{status}: {message}"}
-                for message in exc.messages
-            )
+            errors.extend(f"{path}.{status}: {message}" for message in exc.messages)
     return errors
 
 
