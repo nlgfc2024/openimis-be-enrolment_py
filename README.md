@@ -19,24 +19,30 @@ The module accepts the following `MODULE_CONFIGURATION` keys:
 - `max_enrolment_score`: highest score a weighted ranking may award (default
   `100`). A ranking is rejected if its components' maximum points add up to
   more than this, or if its `weighted_score.normalise_to` is above it.
-- `programme_profiles`: eligibility rules shared by a programme's Phases (see
-  below; default `{}`).
+- `programme_profiles`: eligibility and ranking rules shared by a programme's
+  Phases (see below; default `{}`).
+- `require_programme_profile`: refuse to enrol into a Phase that matches no
+  programme profile and has no `default` to fall back on (default `false`).
 
 The individual and group maker-checker validation event names can be overridden
 with `validation_enrollment` and `validation_group_enrollment`.
 
 ## Programme profiles
 
-`programme_profiles` holds eligibility rules that apply to every enrolment into
-a programme, so they don't have to be copied into each Phase. Profiles are keyed
-by `BenefitPlan.code`, matched without regard to case. A Phase whose code has no
-profile uses `default`; without a `default` it uses only its own criteria.
+`programme_profiles` holds eligibility and ranking rules that apply to every
+enrolment into a programme, so they don't have to be copied into each Phase.
+Profiles are keyed by `BenefitPlan.code`, matched without regard to case. A
+Phase whose code has no profile uses `default`; without a `default` it uses only
+its own criteria and ranking, unless `require_programme_profile` is on.
 
-A profile does not yet say which Phase type it is for, so `default` applies to
-GROUP and INDIVIDUAL Phases alike. On an instance with both types, keep
-`household` and member subjects out of `default`: an INDIVIDUAL Phase that
-falls back to it fails when enrolment runs. Put those criteria in profiles keyed
-by the GROUP Phases' codes instead.
+A profile does not name a Phase type; its content decides which types can use
+it. A `household` or member subject, or a ranking that reads a household member,
+only suits GROUP Phases. A `self` subject or a `SELF` quota source only suits
+INDIVIDUAL Phases. A profile with neither suits both. A profile that suits
+neither type is rejected when the configuration is saved, and a Phase whose type
+its profile does not suit fails when enrolment runs. On an instance with both
+Phase types, keep GROUP-only rules out of `default` and key them by the GROUP
+Phases' codes instead.
 
 ```json
 "programme_profiles": {
@@ -47,12 +53,17 @@ by the GROUP Phases' codes instead.
         {"subject": "household", "field": "validation_status", "filter": "exact", "type": "string", "value": "VERIFIED"},
         {"subject": "primary_worker", "field": "business_experience", "filter": "exact", "type": "string", "value": "Yes"}
       ]
+    },
+    "ranking": {
+      "*": {
+        "order_by": [{"subject": "head", "field": "household_pmt_score", "cast": "float", "direction": "asc", "nulls": "last"}]
+      }
     }
   }
 }
 ```
 
-- A profile may contain `description` and `eligibility`.
+- A profile may contain `description`, `eligibility` and `ranking`.
 - Profiles don't set a registry source. Enrolment already keeps only records
   whose `json_ext.data_source` matches the Phase's own `json_ext.data_source`.
   A Phase without one uses `ubr`, which also matches untagged records. On an
@@ -70,10 +81,17 @@ by the GROUP Phases' codes instead.
     `any_member`.
   - Criteria with the same member subject must all be met by one member. For
     example, two `any_member` criteria need a single member who meets both.
+- `ranking` has the same shape as a Phase's `enrolment_ranking`: entries keyed
+  by beneficiary status, or `*` for any status. A Phase that has its own
+  `enrolment_ranking` entry for the status (or `*`) uses it instead of the
+  profile's. The enrolment summary shows the ranking that applied.
+- Profile rankings are checked when the configuration is saved, without a
+  Phase's `beneficiary_data_schema`. Name beneficiary data as `json_ext__<key>`
+  or through a member `subject`; enrolment checks the ranking again against the
+  Phase's schema.
 - Only top-level keys are merged with the module defaults, so supply the whole
   `programme_profiles` block when overriding it. The block is validated when
-  the configuration is saved. A subject that doesn't suit the Phase type is
-  rejected when enrolment runs.
+  the configuration is saved.
 
 ## Ranking and confirmation
 
