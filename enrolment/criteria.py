@@ -77,7 +77,10 @@ def _validate_enrolment_phase(benefit_plan, benefit_plan_id, status, expected_ty
 def merge_enrolment_criteria(
     custom_filters, benefit_plan_id, status, expected_type=None, *, benefit_plan=None,
 ):
-    """Return immutable, Phase, and operator criteria as one AND-ed list."""
+    """Return the Phase's criteria and the operator's filters as one AND-ed list.
+
+    Programme profile criteria are applied separately by the candidate sources.
+    """
     operator_filters = list(custom_filters or [])
     if benefit_plan is None:
         benefit_plan = load_enrolment_phase(benefit_plan_id, status, expected_type)
@@ -86,9 +89,6 @@ def merge_enrolment_criteria(
         # type/status checks previously performed by the second database load.
         _validate_enrolment_phase(benefit_plan, benefit_plan_id, status, expected_type)
     validate_operator_filters(operator_filters, benefit_plan)
-
-    configured = EnrolmentConfig.mandatory_enrollment_criteria or {}
-    system_criteria = configured.get(expected_type or benefit_plan.type, {}) or {}
 
     json_ext = benefit_plan.json_ext or {}
     if isinstance(json_ext, str):
@@ -103,13 +103,10 @@ def merge_enrolment_criteria(
 
     combined_filters = []
     seen = set()
-    for entry in (
-        list(system_criteria.get(status, []) or [])
-        + list(criteria.get(status, []) or [])
-    ):
+    for entry in criteria.get(status, []) or []:
         condition = criterion_to_condition(entry)
         if not condition:
-            raise ValidationError("Malformed mandatory enrolment criterion.")
+            raise ValidationError("Malformed enrolment criterion.")
         if condition not in seen:
             combined_filters.append(condition)
             seen.add(condition)
@@ -201,40 +198,6 @@ def criterion_to_condition(entry):
     if value_type == "string":
         value = json.dumps(value)
     return f"{field}__{filter_name}__{value_type}={value}"
-
-
-def validate_mandatory_enrolment_criteria(criteria):
-    if not isinstance(criteria, dict):
-        raise ValidationError({"config": [
-            "mandatory_enrollment_criteria must be an object."
-        ]})
-    unexpected = set(criteria) - {"INDIVIDUAL", "GROUP"}
-    errors = []
-    if unexpected:
-        errors.append(
-            "Unsupported mandatory_enrollment_criteria types: "
-            + ", ".join(sorted(unexpected))
-        )
-    for plan_type in ("INDIVIDUAL", "GROUP"):
-        statuses = criteria.get(plan_type, {})
-        if not isinstance(statuses, dict):
-            errors.append(
-                f"mandatory_enrollment_criteria.{plan_type} must be an object."
-            )
-            continue
-        for status, entries in statuses.items():
-            if not isinstance(status, str) or not isinstance(entries, list):
-                errors.append(
-                    f"mandatory_enrollment_criteria.{plan_type} entries must be lists."
-                )
-                continue
-            if any(not criterion_to_condition(entry) for entry in entries):
-                errors.append(
-                    f"mandatory_enrollment_criteria.{plan_type}.{status} "
-                    "contains a malformed criterion."
-                )
-    if errors:
-        raise ValidationError({"config": errors})
 
 
 # Compatibility aliases for callers using the earlier names.

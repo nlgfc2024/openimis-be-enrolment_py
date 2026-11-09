@@ -11,8 +11,16 @@ from core.module_config_registry import register_reloader, register_validator
 logger = logging.getLogger(__name__)
 
 
+# Replaced by programme_profiles. Its criteria are no longer applied, so a
+# configuration that still holds some is rejected on save and logged on load.
+RETIRED_MANDATORY_CRITERIA_KEY = "mandatory_enrollment_criteria"
+RETIRED_MANDATORY_CRITERIA_MESSAGE = (
+    "mandatory_enrollment_criteria is no longer applied. Move its criteria to a "
+    "programme profile's eligibility.criteria (or to a Phase's advanced_criteria "
+    "for a single beneficiary status), then remove the key."
+)
+
 DEFAULT_CONFIG = {
-    "mandatory_enrollment_criteria": {"INDIVIDUAL": {}, "GROUP": {}},
     "enable_maker_checker_logic_enrollment": True,
     "enable_household_district_filter": False,
     "validation_enrollment": "validation-enrollment",
@@ -36,7 +44,6 @@ class EnrolmentConfig(AppConfig):
     name = "enrolment"
     verbose_name = "Enrolment"
 
-    mandatory_enrollment_criteria = None
     enable_maker_checker_logic_enrollment = None
     enable_household_district_filter = False
     validation_enrollment = None
@@ -63,19 +70,19 @@ class EnrolmentConfig(AppConfig):
 
     @classmethod
     def _load_config(cls, config):
+        if _holds_mandatory_criteria(config):
+            logger.warning(RETIRED_MANDATORY_CRITERIA_MESSAGE)
         for field, value in {**DEFAULT_CONFIG, **config}.items():
             if hasattr(cls, field):
                 setattr(cls, field, value)
 
     @classmethod
     def _validate_config(cls, config):
-        from enrolment.criteria import validate_mandatory_enrolment_criteria
         from enrolment.profiles import validate_programme_profiles
 
-        validate_mandatory_enrolment_criteria(
-            config.get("mandatory_enrollment_criteria", {})
-        )
         errors = []
+        if _holds_mandatory_criteria(config):
+            errors.append(RETIRED_MANDATORY_CRITERIA_MESSAGE)
         for field in (
             "validation_enrollment",
             "validation_group_enrollment",
@@ -144,3 +151,20 @@ class EnrolmentConfig(AppConfig):
             "enrolment.ranking",
             benefit_plan_ranking_validation_errors,
         )
+
+
+def _holds_mandatory_criteria(config):
+    """Whether a configuration still sets retired mandatory enrolment criteria.
+
+    The empty shape older configurations carry ({"INDIVIDUAL": {}, "GROUP": {}})
+    is accepted, so they keep saving until the key is removed.
+    """
+    criteria = config.get(RETIRED_MANDATORY_CRITERIA_KEY)
+    if not criteria:
+        return False
+    if not isinstance(criteria, dict):
+        return True
+    return any(
+        not isinstance(statuses, dict) or any(statuses.values())
+        for statuses in criteria.values()
+    )

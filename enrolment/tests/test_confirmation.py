@@ -1,4 +1,3 @@
-import copy
 from django.core.exceptions import ValidationError
 from unittest.mock import patch
 
@@ -30,20 +29,6 @@ from openIMIS.schema import schema as assembled_schema
 
 
 class EnrolmentConfirmationTest(IndividualGQLTestCase):
-    def setUp(self):
-        self.original_mandatory_criteria = copy.deepcopy(
-            EnrolmentConfig.mandatory_enrollment_criteria
-        )
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {},
-        }
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = (
-            self.original_mandatory_criteria
-        )
-
     def _plan(self, plan_type, token):
         return create_benefit_plan(
             self.admin_user.username,
