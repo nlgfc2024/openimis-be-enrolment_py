@@ -89,6 +89,22 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
                     any(message in error for error in errors), errors
                 )
 
+    def test_profile_must_suit_a_phase_type(self):
+        self.assertEqual(validate_programme_profiles({
+            "GROUP_ONLY": {"eligibility": {"criteria": [_criterion(subject="head")]}},
+            "INDIVIDUAL_ONLY": {"eligibility": {"criteria": [_criterion(subject="self")]}},
+            "EITHER": {"eligibility": {"criteria": [_criterion()]}},
+        }), [])
+
+        errors = validate_programme_profiles({"MIXED": {"eligibility": {"criteria": [
+            _criterion(subject="household"), _criterion(subject="self"),
+        ]}}})
+        self.assertEqual(errors, [
+            "programme_profiles.MIXED suits neither Phase type. "
+            "GROUP Phases: eligibility.criteria[1] uses subject self. "
+            "INDIVIDUAL Phases: eligibility.criteria[0] uses subject household."
+        ])
+
     def test_module_config_rejects_invalid_profiles(self):
         config = copy.deepcopy(DEFAULT_CONFIG)
         config["programme_profiles"] = {"RMEP": {"ranking": {}}}
@@ -174,15 +190,17 @@ class ProgrammeProfileEligibilityTest(SimpleTestCase):
 
     def test_subject_must_suit_the_phase_type(self):
         with self.assertRaisesMessage(
-            ValidationError, "uses subject self, which GROUP Phases"
+            ValidationError,
+            "Programme profile default cannot be used by GROUP Phases: "
+            "eligibility.criteria[0] uses subject self.",
         ):
             self._apply([_criterion(subject="self")], Group, "GROUP")
         with self.assertRaisesMessage(
-            ValidationError, "uses subject household, which INDIVIDUAL Phases"
+            ValidationError, "INDIVIDUAL Phases: eligibility.criteria[0] uses subject household"
         ):
             self._apply([_criterion(subject="household")], Individual, "INDIVIDUAL")
         with self.assertRaisesMessage(
-            ValidationError, "uses subject primary_worker, which INDIVIDUAL Phases"
+            ValidationError, "INDIVIDUAL Phases: eligibility.criteria[0] uses subject primary_worker"
         ):
             self._apply(
                 [_criterion(subject="primary_worker")], Individual, "INDIVIDUAL"
