@@ -3,6 +3,10 @@
 Profiles live in the ``programme_profiles`` module configuration, keyed by
 ``BenefitPlan.code`` (matched case-insensitively) with ``default`` as the
 fallback. A Phase that matches no profile keeps its own criteria only.
+
+A profile does not name a Phase type. The types it suits follow from its
+content (for example, a ``head`` criterion only suits GROUP Phases), and a
+profile that suits neither is rejected when the configuration is saved.
 """
 from django.core.exceptions import ValidationError
 from django.db.models import Exists, OuterRef
@@ -19,6 +23,7 @@ PROFILE_KEYS = {"description", "eligibility"}
 ELIGIBILITY_KEYS = {"criteria"}
 CRITERION_KEYS = {"subject", "field", "filter", "type", "value"}
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
+PHASE_TYPES = tuple(CANDIDATE_SUBJECTS)
 
 
 def validate_programme_profiles(profiles):
@@ -43,12 +48,44 @@ def validate_programme_profiles(profiles):
             errors.append(
                 f"Unsupported {path} keys: " + ", ".join(sorted(unexpected))
             )
+        profile_errors = []
         description = profile.get("description")
         if description is not None and not isinstance(description, str):
-            errors.append(f"{path}.description must be a string.")
-        errors.extend(
+            profile_errors.append(f"{path}.description must be a string.")
+        profile_errors.extend(
             _eligibility_errors(profile.get("eligibility", {}), f"{path}.eligibility")
         )
+        if not unexpected and not profile_errors:
+            profile_errors.extend(_unsuitable_profile_errors(profile, path))
+        errors.extend(profile_errors)
+    return errors
+
+
+def _unsuitable_profile_errors(profile, path):
+    """Report a profile that no Phase type can use, with each type's reasons."""
+    reasons = {
+        phase_type: phase_type_errors(profile, phase_type)
+        for phase_type in PHASE_TYPES
+    }
+    if not all(reasons.values()):
+        return []
+    return [f"{path} suits neither Phase type. " + " ".join(
+        f"{phase_type} Phases: " + "; ".join(errors) + "."
+        for phase_type, errors in reasons.items()
+    )]
+
+
+def phase_type_errors(profile, phase_type):
+    """Return why Phases of ``phase_type`` cannot use ``profile``."""
+    subjects = {CANDIDATE_SUBJECTS[phase_type]}
+    if phase_type == "GROUP":
+        subjects |= set(MEMBER_SUBJECTS)
+    errors = []
+    criteria = (profile.get("eligibility") or {}).get("criteria") or []
+    for index, criterion in enumerate(criteria):
+        subject = criterion.get("subject")
+        if subject is not None and subject not in subjects:
+            errors.append(f"eligibility.criteria[{index}] uses subject {subject}")
     return errors
 
 
@@ -112,18 +149,17 @@ def apply_profile_eligibility(queryset, benefit_plan, phase_type):
     key, profile = resolve_programme_profile(benefit_plan)
     if profile is None:
         return queryset
+    errors = phase_type_errors(profile, phase_type)
+    if errors:
+        raise ValidationError(
+            f"Programme profile {key} cannot be used by {phase_type} Phases: "
+            + "; ".join(errors) + "."
+        )
     eligibility = profile.get("eligibility") or {}
     candidate_subject = CANDIDATE_SUBJECTS[phase_type]
     conditions_by_subject = {}
     for criterion in eligibility.get("criteria") or []:
         subject = criterion.get("subject", candidate_subject)
-        if subject != candidate_subject and (
-            phase_type != "GROUP" or subject not in MEMBER_SUBJECTS
-        ):
-            raise ValidationError(
-                f"Programme profile {key} uses subject {subject}, which "
-                f"{phase_type} Phases do not support."
-            )
         conditions_by_subject.setdefault(subject, []).append(
             criterion_to_condition(criterion)
         )
