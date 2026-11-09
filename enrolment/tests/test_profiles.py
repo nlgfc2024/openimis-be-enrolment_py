@@ -289,15 +289,13 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
         )
         EnrolmentConfig.programme_profiles = {}
 
-    def _plan(self, token, criteria, ranking=None, phase_ranking=None, **payload):
+    def _plan(self, token, criteria, ranking=None, **payload):
         json_ext = {"advanced_criteria": {"ACTIVE": [{
             "field": "enrolment_test",
             "filter": "exact",
             "type": "string",
             "value": token,
         }]}}
-        if phase_ranking is not None:
-            json_ext["enrolment_ranking"] = {"ACTIVE": phase_ranking}
         plan = create_benefit_plan(self.admin_user.username, payload_override={
             "type": "GROUP",
             "beneficiary_data_schema": {
@@ -415,21 +413,6 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
 
         # Lowest PMT first, so the household created second takes the place.
         self.assertEqual(self._eligible(plan), {poorer.id})
-
-    def test_phase_ranking_replaces_the_profile_ranking(self):
-        token = "phase-ranking"
-        plan = self._plan(
-            token,
-            [],
-            ranking={"order_by": [{
-                "subject": "head", "field": "household_pmt_score", "cast": "float",
-            }]},
-            phase_ranking={"order_by": ["id"]},
-            max_beneficiaries=1,
-        )
-        richer, _ = self._households_by_head_pmt(token)
-
-        self.assertEqual(self._eligible(plan), {richer.id})
 
     @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
     def test_approval_rechecks_a_profile_changed_after_confirmation(self):

@@ -11,6 +11,7 @@ from enrolment.criteria import validate_operator_filters as _validate_operator_f
 from core.test_helpers import LogInHelper, create_test_interactive_user, create_test_language
 from individual.models import Group
 from enrolment.services import build_group_enrollment_queryset
+from enrolment.tests.helpers import ProfileRankingMixin
 from individual.tests.test_helpers import create_group, create_sp_role
 from location.models import Location, UserDistrict, cache, free_cache_for_user
 from social_protection.tests.test_helpers import create_benefit_plan
@@ -78,8 +79,9 @@ class DistrictFilterContractTest(SimpleTestCase):
 
 
 @override_settings(ROW_SECURITY=True)
-class DistrictEnrollmentQueryTest(TestCase):
+class DistrictEnrollmentQueryTest(ProfileRankingMixin, TestCase):
     def setUp(self):
+        super().setUp()
         flag = patch.object(EnrolmentConfig, "enable_household_district_filter", True)
         flag.start()
         self.addCleanup(flag.stop)
@@ -226,8 +228,10 @@ class DistrictEnrollmentQueryTest(TestCase):
         from social_protection.models import GroupBeneficiary
         from enrolment.services import build_group_enrollment_selection
         self.plan.max_beneficiaries = 1
-        self.plan.json_ext["enrolment_ranking"] = {"ACTIVE": {"order_by": ["id"], "limit": {"percentage": 100}}}
         self.plan.save(username=self.admin.username)
+        EnrolmentConfig.programme_profiles = {self.plan.code: {"ranking": {
+            "ACTIVE": {"order_by": ["id"], "limit": {"percentage": 100}},
+        }}}
         GroupBeneficiary(group=self.other, benefit_plan=self.plan, status="ACTIVE").save(username=self.admin.username)
         selected = build_group_enrollment_selection(self.conditions(self.a), str(self.plan.id), "ACTIVE", self.user)
         self.assertEqual(selected["pool_size"], 1)
@@ -318,10 +322,10 @@ class DistrictEnrollmentQueryTest(TestCase):
     def test_verified_pool_is_before_cap_and_target_is_not_remaining_capacity(self):
         from social_protection.models import GroupBeneficiary
         self.plan.max_beneficiaries = 1
-        self.plan.json_ext['enrolment_ranking'] = {
-            'ACTIVE': {'order_by': ['id'], 'limit': {'percentage': 100}},
-        }
         self.plan.save(username=self.admin.username)
+        EnrolmentConfig.programme_profiles = {self.plan.code: {'ranking': {
+            'ACTIVE': {'order_by': ['id'], 'limit': {'percentage': 100}},
+        }}}
         GroupBeneficiary(group=self.other, benefit_plan=self.plan, status='ACTIVE').save(
             username=self.admin.username)
         self.assertEqual(self.summary(self.a), {

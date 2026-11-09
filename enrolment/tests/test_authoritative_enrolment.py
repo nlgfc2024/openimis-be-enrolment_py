@@ -24,12 +24,12 @@ from enrolment.ranking import (
     calculate_cap,
     build_order_by,
     build_weighted_score,
-    load_ranking_spec,
     rank_and_cap_queryset,
     validate_ranking_spec,
 )
 from individual.models import Group, GroupIndividual, Individual
 from enrolment.schema import Query
+from enrolment.tests.helpers import ProfileRankingMixin
 from individual.custom_filters import GroupCustomFilterWizard, IndividualCustomFilterWizard
 from individual.tests.test_helpers import (
     add_individual_to_group,
@@ -554,10 +554,36 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         self.assertIn("business_type", sql)
         self.assertIn("primary_worker", sql)
 
-    def test_string_json_ext_snapshot_uses_status_then_wildcard(self):
-        plan = Mock(json_ext='{"enrolment_ranking":{"*":{"order_by":["id"]},"ACTIVE":{"order_by":["-id"]}}}')
-        self.assertEqual(load_ranking_spec(plan, "ACTIVE")["order_by"], ["-id"])
-        self.assertEqual(load_ranking_spec(plan, "POTENTIAL")["order_by"], ["id"])
+    def test_profile_ranking_uses_status_then_wildcard(self):
+        from enrolment.profiles import profile_ranking_spec
+
+        profiles = {"default": {"ranking": {
+            "*": {"order_by": ["id"]}, "ACTIVE": {"order_by": ["-id"]},
+        }}}
+        plan = Mock(code="PWP", json_ext={})
+        with patch.object(EnrolmentConfig, "programme_profiles", profiles):
+            self.assertEqual(profile_ranking_spec(plan, "ACTIVE")["order_by"], ["-id"])
+            self.assertEqual(profile_ranking_spec(plan, "POTENTIAL")["order_by"], ["id"])
+
+    @patch("enrolment.ranking.build_order_by", side_effect=lambda queryset, order: queryset)
+    def test_phase_ranking_is_ignored_and_logged(self, build_order):
+        queryset = MagicMock(model=Individual)
+        queryset.count.return_value = 3
+        plan = Mock(
+            code="PWP-1",
+            json_ext={"enrolment_ranking": {"ACTIVE": {"order_by": ["-id"]}}},
+            max_beneficiaries=1,
+        )
+        with patch.object(EnrolmentConfig, "programme_profiles", {}), \
+                self.assertLogs("enrolment.ranking", "WARNING") as logs:
+            _, metadata = rank_and_cap_queryset(
+                queryset, plan, "ACTIVE", 0, materialize_selected_ids=False,
+            )
+
+        self.assertIsNone(metadata["ranking"])
+        self.assertEqual(metadata["will_enrol"], 3)
+        build_order.assert_not_called()
+        self.assertIn("Phase PWP-1 still has an enrolment_ranking", logs.output[0])
 
     def test_string_and_object_ordering_compile_as_annotated_distinct_sql(self):
         order_items, _, _ = validate_ranking_spec({
@@ -658,18 +684,24 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                 Group,
             )
 
-    def test_benefit_plan_validator_uses_the_runtime_ranking_validator(self):
+    def test_phase_validator_rejects_a_phase_ranking(self):
         from enrolment.ranking import benefit_plan_ranking_validation_errors
 
         errors = benefit_plan_ranking_validation_errors({
             "type": "GROUP",
-            "beneficiary_data_schema": {"properties": {}},
-            "json_ext": {"enrolment_ranking": {"ACTIVE": {
-                "order_by": ["groupindividuals__individual__dob"],
-            }}},
+            "json_ext": {"enrolment_ranking": {"ACTIVE": {"order_by": ["id"]}}},
         })
+        self.assertEqual(len(errors), 1)
+        self.assertIn("A Phase can no longer have an enrolment_ranking", errors[0]["message"])
+        self.assertIn("programme_profiles.<Phase code or default>.ranking", errors[0]["message"])
 
-        self.assertIn("multi-valued path", errors[0]["message"])
+        # Clearing the ranking, or an update that leaves json_ext out, is accepted.
+        self.assertEqual(benefit_plan_ranking_validation_errors(
+            {"json_ext": {"enrolment_ranking": {}}}
+        ), [])
+        self.assertEqual(benefit_plan_ranking_validation_errors(
+            {"name": "Renamed"}, Mock(json_ext={"enrolment_ranking": {"*": {}}})
+        ), [])
 
     @patch("enrolment.ranking.build_order_by")
     def test_cast_data_error_names_the_configured_field(
@@ -684,24 +716,17 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         ranked.values_list.return_value.__getitem__.return_value.__iter__.side_effect = (
             DataError('invalid input syntax for type integer: "Poorer"')
         )
-        benefit_plan = Mock(
-            json_ext={
-                "enrolment_ranking": {
-                    "*": {
-                        "order_by": [{
-                            "field": "json_ext__household_wealth_quintile",
-                            "cast": "int",
-                        }]
-                    }
-                }
-            },
-            max_beneficiaries=None,
-        )
+        benefit_plan = Mock(code="PWP", json_ext={}, max_beneficiaries=None)
+        profiles = {"default": {"ranking": {"*": {"order_by": [{
+            "field": "json_ext__household_wealth_quintile",
+            "cast": "int",
+        }]}}}}
 
-        with self.assertRaisesMessage(
-            ValidationError,
-            "json_ext__household_wealth_quintile (int)",
-        ):
+        with patch.object(EnrolmentConfig, "programme_profiles", profiles), \
+                self.assertRaisesMessage(
+                    ValidationError,
+                    "json_ext__household_wealth_quintile (int)",
+                ):
             rank_and_cap_queryset(queryset, benefit_plan, "ACTIVE", 0)
 
     @patch("enrolment.confirmation.confirm_individual_enrolment")
@@ -799,7 +824,7 @@ class EnrollmentPreviewResolverTest(SimpleTestCase):
 
 
 @override_settings(ROW_SECURITY=False)
-class AuthoritativeEnrollmentTest(TestCase):
+class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.user = LogInHelper().get_or_create_user_api()
@@ -844,7 +869,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         })
 
     def _youth_quota_fixture(self):
-        benefit_plan = create_benefit_plan(
+        benefit_plan = self._ranked_plan(
             self.user.username,
             payload_override={
                 "type": "INDIVIDUAL",
@@ -886,7 +911,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         return benefit_plan, {individual.id for individual in selected}
 
     def _weighted_quota_plan(self, cap):
-        return create_benefit_plan(
+        return self._ranked_plan(
             self.user.username,
             payload_override={
                 "type": "INDIVIDUAL",
@@ -1245,7 +1270,7 @@ class AuthoritativeEnrollmentTest(TestCase):
             )
 
     def test_numeric_json_ranking_and_percentage_cap_are_applied_together(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 10,
             "beneficiary_data_schema": {
@@ -1289,7 +1314,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         self.assertEqual(selection["selected_ids"], [ranked.id, second.id])
 
     def test_preview_caps_with_filterable_subquery_without_materialising_ids(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 10,
             "beneficiary_data_schema": {
@@ -1328,7 +1353,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
     def test_remaining_status_capacity_limits_cumulative_enrollment(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 2,
             "json_ext": {
@@ -1361,7 +1386,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         self.assertEqual(selection["will_enrol"], 1)
 
     def test_group_ranking_cap_and_nulls_last(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "GROUP",
             "beneficiary_data_schema": {
                 "properties": {
@@ -1404,7 +1429,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
     def test_group_weighted_ranking_reads_primary_worker_business_data(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "GROUP",
             "beneficiary_data_schema": {
                 "properties": {"test_scope": {"type": "string"}}
@@ -1489,7 +1514,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
     def test_group_quotas_use_primary_worker_gender_and_dob_with_phase_cap(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "GROUP",
             "max_beneficiaries": 2,
             "beneficiary_data_schema": {"properties": {}},
@@ -1536,7 +1561,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         )
 
     def test_group_quotas_can_use_household_head_gender_and_dob(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "GROUP",
             "max_beneficiaries": 2,
             "beneficiary_data_schema": {"properties": {}},
@@ -1605,7 +1630,7 @@ class AuthoritativeEnrollmentTest(TestCase):
 
     def _assert_orders_by_head_pmt_score(self, stored):
         """Rank households by the head's PMT score, stored with ``stored``."""
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "GROUP",
             "max_beneficiaries": 3,
             "beneficiary_data_schema": {"properties": {}},
@@ -1653,7 +1678,7 @@ class AuthoritativeEnrollmentTest(TestCase):
         self.assertEqual(selection["pool_size"], 5)
 
     def test_configured_count_quota_shortfall_goes_to_next_ranked(self):
-        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 4,
             "beneficiary_data_schema": {

@@ -9,6 +9,7 @@ from enrolment.services import (
     build_individual_enrolment_selection,
 )
 from enrolment.schema import Mutation as EnrolmentMutation, Query as EnrolmentQuery
+from enrolment.tests.helpers import ProfileRankingMixin
 from individual.models import IndividualDataSource
 from individual.schema import Mutation as IndividualMutation, Query as IndividualQuery
 from individual.tests.test_helpers import (
@@ -28,7 +29,7 @@ from tasks_management.services import TaskService
 from openIMIS.schema import schema as assembled_schema
 
 
-class EnrolmentConfirmationTest(IndividualGQLTestCase):
+class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     def _plan(self, plan_type, token):
         return create_benefit_plan(
             self.admin_user.username,
@@ -76,7 +77,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
         return individual, group, membership
 
     def _percentage_plan(self, plan_type, token):
-        return create_benefit_plan(
+        return self._ranked_plan(
             self.admin_user.username,
             payload_override={
                 "type": plan_type,
@@ -429,7 +430,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_approval_rechecks_remaining_capacity_under_plan_lock(self):
         token = "approval-capacity"
-        plan = create_benefit_plan(
+        plan = self._ranked_plan(
             self.admin_user.username,
             payload_override={
                 "type": "INDIVIDUAL",
@@ -564,7 +565,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_approval_keeps_places_filled_after_a_quota_shortfall(self):
         token = "quota-shortfall-group"
-        plan = create_benefit_plan(
+        plan = self._ranked_plan(
             self.admin_user.username,
             payload_override={
                 "type": "GROUP",
