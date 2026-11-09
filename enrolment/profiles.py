@@ -171,6 +171,11 @@ def apply_profile_eligibility(queryset, benefit_plan, phase_type):
     """Restrict candidates to the eligibility rules of the Phase's profile."""
     key, profile = resolve_programme_profile(benefit_plan)
     if profile is None:
+        if EnrolmentConfig.require_programme_profile:
+            raise ValidationError(
+                f"Phase {benefit_plan.code} matches no programme profile, and "
+                "require_programme_profile is on."
+            )
         return queryset
     errors = phase_type_errors(profile, phase_type)
     if errors:

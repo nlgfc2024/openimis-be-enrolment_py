@@ -24,8 +24,11 @@ DEFAULT_CONFIG = {
     "registry_verified_household_value": "VERIFIED",
     "bulk_enrollment_batch_size": 1000,
     "max_enrolment_score": 100,
-    # Eligibility rules shared by a programme's Phases, keyed by BenefitPlan code.
+    # Eligibility and ranking rules shared by a programme's Phases, keyed by
+    # BenefitPlan code.
     "programme_profiles": {},
+    # Refuse to enrol into a Phase that matches no programme profile.
+    "require_programme_profile": False,
 }
 
 
@@ -46,6 +49,7 @@ class EnrolmentConfig(AppConfig):
     bulk_enrollment_batch_size = None
     max_enrolment_score = None
     programme_profiles = None
+    require_programme_profile = False
 
     def ready(self):
         from core.models import ModuleConfiguration
@@ -87,6 +91,8 @@ class EnrolmentConfig(AppConfig):
             errors.append("enable_maker_checker_logic_enrollment must be boolean.")
         if not isinstance(config.get("enable_household_district_filter", False), bool):
             errors.append("enable_household_district_filter must be boolean.")
+        if not isinstance(config.get("require_programme_profile", False), bool):
+            errors.append("require_programme_profile must be boolean.")
         batch_size = config.get("bulk_enrollment_batch_size")
         if type(batch_size) is not int or batch_size < 1:
             errors.append("bulk_enrollment_batch_size must be a positive integer.")

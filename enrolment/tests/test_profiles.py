@@ -167,6 +167,24 @@ class ProgrammeProfileResolutionTest(SimpleTestCase):
         with patch.object(EnrolmentConfig, "programme_profiles", self.profiles):
             self.assertEqual(resolve_programme_profile(Mock(code="UPG"))[0], "default")
 
+    def test_required_profile_must_match(self):
+        with patch.object(EnrolmentConfig, "programme_profiles", {"RMEP": {}}), \
+                patch.object(EnrolmentConfig, "require_programme_profile", True):
+            with self.assertRaisesMessage(
+                ValidationError,
+                "Phase UPG matches no programme profile, and "
+                "require_programme_profile is on.",
+            ):
+                apply_profile_eligibility(Group.objects.all(), Mock(code="UPG"), "GROUP")
+            # A Phase that matches a profile is enrolled as usual.
+            apply_profile_eligibility(Group.objects.all(), Mock(code="rmep"), "GROUP")
+
+    def test_module_config_requires_a_boolean_profile_requirement(self):
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["require_programme_profile"] = "yes"
+        with self.assertRaisesMessage(ValidationError, "require_programme_profile must be boolean"):
+            EnrolmentConfig._validate_config(config)
+
     def test_no_profile_applies_without_match_or_default(self):
         with patch.object(EnrolmentConfig, "programme_profiles", {"RMEP": {}}):
             self.assertEqual(resolve_programme_profile(Mock(code="UPG")), (None, None))
