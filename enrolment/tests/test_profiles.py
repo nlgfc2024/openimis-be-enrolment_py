@@ -185,6 +185,23 @@ class ProgrammeProfileResolutionTest(SimpleTestCase):
         with self.assertRaisesMessage(ValidationError, "require_programme_profile must be boolean"):
             EnrolmentConfig._validate_config(config)
 
+    def test_retired_mandatory_criteria_are_rejected_on_save_and_logged_on_load(self):
+        retired = {"INDIVIDUAL": {}, "GROUP": {"ACTIVE": [_criterion()]}}
+        config = {**copy.deepcopy(DEFAULT_CONFIG), "mandatory_enrollment_criteria": retired}
+        with self.assertRaisesMessage(
+            ValidationError, "mandatory_enrollment_criteria is no longer applied"
+        ):
+            EnrolmentConfig._validate_config(config)
+        with self.assertLogs("enrolment.apps", "WARNING") as logs:
+            EnrolmentConfig._load_config(config)
+        self.assertIn("programme profile's eligibility.criteria", logs.output[0])
+
+        # The empty shape older configurations carry still saves.
+        EnrolmentConfig._validate_config({
+            **copy.deepcopy(DEFAULT_CONFIG),
+            "mandatory_enrollment_criteria": {"INDIVIDUAL": {}, "GROUP": {}},
+        })
+
     def test_no_profile_applies_without_match_or_default(self):
         with patch.object(EnrolmentConfig, "programme_profiles", {"RMEP": {}}):
             self.assertEqual(resolve_programme_profile(Mock(code="UPG")), (None, None))
@@ -266,15 +283,11 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
     """Profiles applied to real registry records, through preview and approval."""
 
     def setUp(self):
-        for name, value in (
-            ("mandatory_enrollment_criteria", {"INDIVIDUAL": {}, "GROUP": {}}),
-            ("programme_profiles", {}),
-        ):
-            self.addCleanup(
-                setattr, EnrolmentConfig, name,
-                copy.deepcopy(getattr(EnrolmentConfig, name)),
-            )
-            setattr(EnrolmentConfig, name, value)
+        self.addCleanup(
+            setattr, EnrolmentConfig, "programme_profiles",
+            copy.deepcopy(EnrolmentConfig.programme_profiles),
+        )
+        EnrolmentConfig.programme_profiles = {}
 
     def _plan(self, token, criteria, ranking=None, phase_ranking=None, **payload):
         json_ext = {"advanced_criteria": {"ACTIVE": [{

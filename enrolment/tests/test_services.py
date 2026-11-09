@@ -1,7 +1,6 @@
 from django.test import TestCase, override_settings
 
 from core.test_helpers import LogInHelper
-from enrolment.apps import EnrolmentConfig
 from enrolment.services import build_individual_enrolment_selection
 from individual.tests.test_helpers import create_group_with_individual, create_individual
 from social_protection.tests.test_helpers import create_benefit_plan
@@ -13,16 +12,6 @@ class IndividualEnrolmentSelectionTest(TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.user = LogInHelper().get_or_create_user_api()
-
-    def setUp(self):
-        self.original_criteria = EnrolmentConfig.mandatory_enrollment_criteria
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {},
-        }
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = self.original_criteria
 
     def test_deleted_group_releases_individual_for_enrolment(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={

@@ -1,4 +1,3 @@
-import copy
 from datetime import date
 from unittest.mock import MagicMock, Mock, patch
 
@@ -805,20 +804,6 @@ class AuthoritativeEnrollmentTest(TestCase):
     def setUpTestData(cls):
         cls.user = LogInHelper().get_or_create_user_api()
 
-    def setUp(self):
-        self.original_mandatory_criteria = copy.deepcopy(
-            EnrolmentConfig.mandatory_enrollment_criteria
-        )
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {},
-        }
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = (
-            self.original_mandatory_criteria
-        )
-
     def _verified_group(self, json_ext=None, individual_json_ext=None, dob=None):
         group_json = dict(json_ext or {})
         group_json.setdefault("validation_status", "VERIFIED")
@@ -1142,18 +1127,15 @@ class AuthoritativeEnrollmentTest(TestCase):
         selected_ids = set(result.values_list("id", flat=True))
         self.assertEqual(selected_ids, {selected.id})
 
-    def test_mandatory_and_saved_phase_criteria_are_anded(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {
-                "ACTIVE": [{
-                    "field": "district",
-                    "filter": "exact",
-                    "type": "string",
-                    "value": "Lilongwe",
-                }]
-            },
-            "GROUP": {},
-        }
+    def test_profile_and_saved_phase_criteria_are_anded(self):
+        self.enterContext(patch.object(EnrolmentConfig, "programme_profiles", {
+            "default": {"eligibility": {"criteria": [{
+                "field": "district",
+                "filter": "exact",
+                "type": "string",
+                "value": "Lilongwe",
+            }]}},
+        }))
         benefit_plan = self._benefit_plan("INDIVIDUAL")
         selected = create_individual(self.user.username, {
             "json_ext": {
@@ -1210,18 +1192,16 @@ class AuthoritativeEnrollmentTest(TestCase):
         self.assertIn(eligible.id, selected_ids)
         self.assertNotIn(pending.id, selected_ids)
 
-    def test_group_immutable_rule_cannot_be_removed_from_phase_or_payload(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {
-                "POTENTIAL": [{
-                    "field": "validation_status",
-                    "filter": "exact",
-                    "type": "string",
-                    "value": "VERIFIED",
-                }]
-            },
-        }
+    def test_group_profile_rule_cannot_be_removed_from_phase_or_payload(self):
+        self.enterContext(patch.object(EnrolmentConfig, "programme_profiles", {
+            "default": {"eligibility": {"criteria": [{
+                "subject": "household",
+                "field": "validation_status",
+                "filter": "exact",
+                "type": "string",
+                "value": "VERIFIED",
+            }]}},
+        }))
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             "type": "GROUP",
             "beneficiary_data_schema": {
