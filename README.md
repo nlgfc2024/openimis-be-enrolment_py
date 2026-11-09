@@ -86,10 +86,11 @@ Phases' codes instead.
     `any_member`.
   - Criteria with the same member subject must all be met by one member. For
     example, two `any_member` criteria need a single member who meets both.
-- `ranking` has the same shape as a Phase's `enrolment_ranking`: entries keyed
-  by beneficiary status, or `*` for any status. A Phase that has its own
-  `enrolment_ranking` entry for the status (or `*`) uses it instead of the
-  profile's. The enrolment summary shows the ranking that applied.
+- `ranking` holds entries keyed by beneficiary status, or `*` for any status.
+  Each entry sets `order_by`, `tie_breaker`, `limit`, `score_source`,
+  `weighted_score` and `selection_strategy` (see the sections below). It is the
+  only place rankings are set; the enrolment summary shows the one that
+  applied.
 - Profile rankings are checked when the configuration is saved, without a
   Phase's `beneficiary_data_schema`. Name beneficiary data as `json_ext__<key>`
   or through a member `subject`; enrolment checks the ranking again against the
@@ -115,8 +116,15 @@ an `order_by` object: `head` (the member with role `HEAD`) or `primary_worker`
 INDIVIDUAL Phases accept only `subject: self`, which is the same as leaving it
 out.
 
-A benefit plan without a ranking configuration retains the legacy behaviour and
-does not apply `max_beneficiaries` as a selection cap.
+Rankings live in programme profiles. A Phase whose profile has no ranking for
+the status (or has no profile) retains the legacy behaviour and does not apply
+`max_beneficiaries` as a selection cap.
+
+A Phase can no longer hold its own `enrolment_ranking`. The Phase validator
+rejects an update that sets one; an empty `enrolment_ranking`, which the Phase
+form sends to clear it, is still accepted. Enrolment ignores a ranking stored on
+a Phase earlier and logs a warning naming the Phase: move it to the Phase's
+profile.
 
 Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
@@ -124,7 +132,7 @@ against current registry and beneficiary data in the same transaction.
 
 ## Selection quotas
 
-`enrolment_ranking[status].selection_strategy` reserves places in the ranked
+A profile ranking's `selection_strategy` reserves places in the ranked
 list for female and youth candidates (`female_percentage`, `youth_percentage`).
 `source` names the person whose gender and date of birth are checked:
 
