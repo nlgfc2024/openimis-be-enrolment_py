@@ -29,6 +29,7 @@ from enrolment.criteria import (
     criterion_to_condition,
     is_number,
 )
+from enrolment.district import district_name
 from enrolment.membership import (
     HEAD_SUBJECT,
     MEMBER_SUBJECTS,
@@ -582,6 +583,18 @@ def _normalise_age_condition(condition, path):
     return {"derived": "age", "filter": filter_name, "value": value}
 
 
+def _normalise_district_condition(condition, path):
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    if condition.get("type", "string") != "string":
+        raise ValidationError(f"{path}.type must be string for district.")
+    if filter_name not in FILTERS_BY_TYPE["string"]:
+        raise ValidationError(f"{path}.filter {filter_name} is not allowed for district.")
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{path}.value must be a district name.")
+    return {"derived": "district", "filter": filter_name, "value": value}
+
+
 def validate_ranking_spec(ranking, model, beneficiary_schema=None):
     if not isinstance(ranking, dict):
         raise ValidationError("enrolment_ranking status entries must be objects.")
@@ -856,10 +869,23 @@ def _age_quota_q(condition):
     )
 
 
+def _district_quota_q(condition):
+    """Match source people whose location lies in the named district."""
+    from individual.models import Individual
+
+    in_district = Individual.objects.annotate(
+        _enrolment_district=district_name()
+    ).filter(**{
+        f"_enrolment_district__{condition['filter']}": condition["value"],
+    })
+    return Q(_selection_individual__in=in_district.values("id"))
+
+
 # Derived values a quota condition may use: name -> (validate and normalise
 # the condition, build its filter on the annotated selection source).
 DERIVED_QUOTA_VALUES = {
     "age": (_normalise_age_condition, _age_quota_q),
+    "district": (_normalise_district_condition, _district_quota_q),
 }
 
 
