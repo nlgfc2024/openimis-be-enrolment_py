@@ -11,9 +11,11 @@ The module accepts the following `MODULE_CONFIGURATION` keys:
 - `enable_maker_checker_logic_enrollment`: stage confirmations for approval.
 - `default_beneficiary_status`: status assigned to newly enrolled beneficiaries.
 - `registry_gender_field`, `registry_primary_worker_field`,
-  `registry_household_verification_field`, and
-  `registry_verified_household_value`: registry field mappings used by ranking
-  and group eligibility.
+  `registry_household_verification_field`, `registry_verified_household_value`,
+  `registry_individual_verification_field` and
+  `registry_verified_individual_value`: registry field mappings used by ranking
+  and the built-in eligibility rules (defaults `gender`, `primary_worker`,
+  `validation_status` and `VERIFIED`).
 - `bulk_enrollment_batch_size`: persistence batch size.
 - `max_enrolment_score`: highest score a weighted ranking may award (default
   `100`). A ranking is rejected if its components' maximum points add up to
@@ -33,13 +35,25 @@ Move them to a profile's `eligibility.criteria`, or to a Phase's
 `advanced_criteria` for a single beneficiary status. The empty
 `{"INDIVIDUAL": {}, "GROUP": {}}` shape is still accepted.
 
+## Built-in eligibility
+
+Some rules apply to every Phase and need no configuration:
+
+- GROUP Phases enrol households that are VERIFIED and have exactly one verified
+  primary worker.
+- INDIVIDUAL Phases enrol VERIFIED individuals who do not belong to an active
+  household.
+
+Programme profiles, Phase criteria and operator filters can only narrow the
+candidates further.
+
 ## Programme profiles
 
 `programme_profiles` holds eligibility and ranking rules that apply to every
 enrolment into a programme, so they don't have to be copied into each Phase.
 Profiles are keyed by `BenefitPlan.code`, matched without regard to case. A
 Phase whose code has no profile uses `default`; without a `default` it uses only
-its own criteria and ranking, unless `require_programme_profile` is on.
+its own criteria and no ranking, unless `require_programme_profile` is on.
 
 A profile does not name a Phase type; its content decides which types can use
 it. A `household` or member subject, or a ranking that reads a household member,
@@ -56,7 +70,6 @@ Phases' codes instead.
     "description": "Rural Micro Enterprise Programme",
     "eligibility": {
       "criteria": [
-        {"subject": "household", "field": "validation_status", "filter": "exact", "type": "string", "value": "VERIFIED"},
         {"subject": "primary_worker", "field": "business_experience", "filter": "exact", "type": "string", "value": "Yes"}
       ]
     },
