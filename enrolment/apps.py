@@ -34,6 +34,9 @@ DEFAULT_CONFIG = {
     "registry_individual_verification_field": "validation_status",
     "registry_verified_individual_value": "VERIFIED",
     "bulk_enrollment_batch_size": 1000,
+    # Location type whose name a derived district value reports, and the type
+    # the household district filter selects.
+    "district_location_type": "R",
     "max_enrolment_score": 100,
     # Eligibility and ranking rules shared by a programme's Phases, keyed by
     # BenefitPlan code.
@@ -59,6 +62,7 @@ class EnrolmentConfig(AppConfig):
     registry_individual_verification_field = None
     registry_verified_individual_value = None
     bulk_enrollment_batch_size = None
+    district_location_type = None
     max_enrolment_score = None
     programme_profiles = None
     require_programme_profile = False
@@ -103,6 +107,7 @@ class EnrolmentConfig(AppConfig):
             "registry_verified_household_value",
             "registry_individual_verification_field",
             "registry_verified_individual_value",
+            "district_location_type",
         ):
             if not isinstance(config.get(field), str) or not config[field].strip():
                 errors.append(f"{field} must be a non-empty string.")
