@@ -135,9 +135,10 @@ the status (or has no profile) retains the legacy behaviour and does not apply
 
 A Phase can no longer hold its own `enrolment_ranking`. The Phase validator
 rejects an update that sets one; an empty `enrolment_ranking`, which the Phase
-form sends to clear it, is still accepted. Enrolment ignores a ranking stored on
-a Phase earlier and logs a warning naming the Phase: move it to the Phase's
-profile.
+form sends to clear it, is still accepted. A Phase that still stores a ranking
+from earlier cannot enrol: preview and confirmation fail with an error naming
+the Phase, rather than enrolling its whole pool uncapped. Move the ranking to
+the Phase's profile and clear it from the Phase.
 
 Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks

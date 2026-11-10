@@ -1,5 +1,4 @@
 import json
-import logging
 import math
 from datetime import date, timedelta
 
@@ -38,7 +37,6 @@ from enrolment.membership import (
     authoritative_primary_worker_memberships,
 )
 
-logger = logging.getLogger(__name__)
 
 SUPPORTED_CASTS = {
     "int": IntegerField,
@@ -1026,9 +1024,11 @@ def rank_and_cap_queryset(
     from enrolment.profiles import profile_ranking_spec
 
     if holds_phase_ranking(benefit_plan.json_ext):
-        logger.warning(
-            "Phase %s still has an enrolment_ranking, which is no longer "
-            "applied. %s", benefit_plan.code, RETIRED_PHASE_RANKING_MESSAGE,
+        # Refuse rather than ignore it: without the ranking the Phase would
+        # enrol its whole pool, uncapped.
+        raise ValidationError(
+            f"Phase {benefit_plan.code} still has an enrolment_ranking, which "
+            f"is no longer applied, so it cannot enrol. {RETIRED_PHASE_RANKING_MESSAGE}"
         )
     ranking = profile_ranking_spec(benefit_plan, status)
     pool_size = queryset.count()
