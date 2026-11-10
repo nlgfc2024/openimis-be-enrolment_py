@@ -557,13 +557,16 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         with_condition({"derived": "district", "filter": "iexact", "value": "Zomba"})
 
     def _ranking_with_component(self, **component):
+        component = {
+            "field": "savings_experience",
+            "weight": 3,
+            "scoring": {"type": "mapping", "values": {"Active": 3}},
+            **component,
+        }
+        if component["field"] is None:
+            del component["field"]
         return {
-            "weighted_score": {"components": [{
-                "field": "savings_experience",
-                "weight": 3,
-                "scoring": {"type": "mapping", "values": {"Active": 3}},
-                **component,
-            }]},
+            "weighted_score": {"components": [component]},
             "order_by": [{"field": "_weighted_score", "direction": "desc"}],
         }
 
@@ -598,6 +601,36 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             ValidationError, "Duplicate weighted score field: any_member.savings_experience."
         ):
             validate_ranking_spec(ranking, Group)
+
+    def test_derived_score_components_are_validated(self):
+        youth = {"type": "numeric_bands", "bands": [{"min": 18, "max": 35, "points": 3}]}
+        cities = {"type": "mapping", "values": {"Zomba": 3}}
+        cases = [
+            ({"field": None, "derived": "income"},
+             "derived income is not supported; supported values: age, district."),
+            ({"derived": "age", "scoring": youth}, "must set exactly one of field or derived."),
+            ({"field": None, "derived": "age", "scoring": youth},
+             "derived age needs a person: set subject to head, primary_worker or any_member."),
+            ({"field": None, "subject": "head", "derived": "age"},
+             "scoring.type must be numeric_bands for age."),
+            ({"field": None, "subject": "head", "derived": "age", "scoring": {
+                "type": "numeric_bands", "bands": [{"min": 17.5, "points": 3}],
+            }}, "scoring.bands[0].min must be a whole number of years."),
+            ({"field": None, "derived": "district", "scoring": youth},
+             "scoring.type must be mapping for district."),
+        ]
+        for component, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    validate_ranking_spec(self._ranking_with_component(**component), Group)
+
+        for model, component in (
+            (Individual, {"field": None, "derived": "age", "scoring": youth}),
+            (Group, {"field": None, "subject": "any_member", "aggregate": "max",
+                     "derived": "age", "scoring": youth}),
+            (Group, {"field": None, "derived": "district", "scoring": cities}),
+        ):
+            validate_ranking_spec(self._ranking_with_component(**component), model)
 
     def test_configured_quota_compiles_field_condition_on_primary_worker(self):
         strategy = _normalise_selection_strategy(self._quota_strategy(
@@ -1829,18 +1862,73 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         )
         self.assertEqual(selection["pool_size"], 5)
 
-    def test_district_quotas_place_individuals_by_their_location(self):
-        def village_in(district_name):
-            def location(kind, parent=None):
-                # Only the district level carries the district's name.
-                name = district_name if kind == "R" else f"{district_name} {kind}"
-                return Location.objects.create(
-                    type=kind, code=f"{district_name}-{kind}", name=name,
-                    parent=parent, audit_user_id=-1,
-                )
-            return location("V", location("W", location("D", location("R"))))
+    def _village_in(self, district_name):
+        """Create a district and a village three levels below it."""
+        def location(kind, parent=None):
+            # Only the district level carries the district's name.
+            name = district_name if kind == "R" else f"{district_name} {kind}"
+            return Location.objects.create(
+                type=kind, code=f"{district_name}-{kind}", name=name,
+                parent=parent, audit_user_id=-1,
+            )
+        return location("V", location("W", location("D", location("R"))))
 
-        zomba, blantyre = village_in("DQ-Zomba"), village_in("DQ-Blantyre")
+    def test_age_score_reads_the_primary_worker_or_the_best_member(self):
+        youth = {"type": "numeric_bands", "bands": [{"min": 18, "max": 35, "points": 10}]}
+        today = date.today()
+        older = self._verified_group(dob=date(today.year - 50, 1, 1))
+        younger = self._verified_group(dob=date(today.year - 25, 1, 1))
+        add_individual_to_group(
+            self.user.username,
+            create_verified_individual(self.user.username, {
+                "dob": date(today.year - 22, 1, 1),
+            }),
+            older,
+            is_head=False,
+        )
+        households = Group.objects.filter(id__in=[older.id, younger.id])
+
+        def scores(component, score_source=None):
+            return dict(build_weighted_score(
+                households,
+                {"normalise_to": 10, "components": [
+                    {"derived": "age", "weight": 10, "scoring": youth, **component},
+                ]},
+                score_source,
+            ).values_list("id", "_weighted_score"))
+
+        # Youth-owned (RMEP): the primary worker's age.
+        self.assertEqual(
+            scores({}, {"type": "PRIMARY_WORKER", "data_field": "individual.json_ext"}),
+            {older.id: 0.0, younger.id: 10.0},
+        )
+        # Labour capacity (UPG): the best-scoring member's age.
+        self.assertEqual(
+            scores({"subject": "any_member", "aggregate": "max"}),
+            {older.id: 10.0, younger.id: 10.0},
+        )
+
+    def test_district_score_reads_where_the_individual_lives(self):
+        in_zomba = create_verified_individual(self.user.username, {
+            "location": self._village_in("DS-Zomba"),
+        })
+        elsewhere = create_verified_individual(self.user.username, {
+            "location": self._village_in("DS-Dedza"),
+        })
+
+        scores = dict(build_weighted_score(
+            Individual.objects.filter(id__in=[in_zomba.id, elsewhere.id]),
+            {"normalise_to": 3, "components": [{
+                "derived": "district",
+                "weight": 3,
+                "scoring": {"type": "mapping", "values": {"DS-Zomba": 3}},
+            }]},
+        ).values_list("id", "_weighted_score"))
+
+        self.assertEqual(scores, {in_zomba.id: 3.0, elsewhere.id: 0.0})
+
+    def test_district_quotas_place_individuals_by_their_location(self):
+        zomba, blantyre = self._village_in("DQ-Zomba"), self._village_in("DQ-Blantyre")
         benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 2,
