@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 # Replaced by programme_profiles. Its criteria are no longer applied, so a
-# configuration that still holds some is rejected on save and logged on load.
+# configuration that still holds some is rejected on save. One already stored
+# is only logged when it is loaded, so the backend still starts.
 RETIRED_MANDATORY_CRITERIA_KEY = "mandatory_enrollment_criteria"
 RETIRED_MANDATORY_CRITERIA_MESSAGE = (
     "mandatory_enrollment_criteria is no longer applied. Move its criteria to a "
@@ -66,7 +67,7 @@ class EnrolmentConfig(AppConfig):
         from core.models import ModuleConfiguration
 
         config = ModuleConfiguration.get_or_default(self.name, DEFAULT_CONFIG)
-        self._validate_config(config)
+        self._validate_config(config, on_load=True)
         self._load_config(config)
         register_validator(self.name, self._validate_module_config)
         register_reloader(self.name, self._reload_module_config)
@@ -81,11 +82,16 @@ class EnrolmentConfig(AppConfig):
                 setattr(cls, field, value)
 
     @classmethod
-    def _validate_config(cls, config):
+    def _validate_config(cls, config, on_load=False):
+        """Raise ValidationError for an invalid configuration.
+
+        ``on_load`` is for a configuration that is already stored: retired
+        mandatory criteria are then left to the warning ``_load_config`` logs.
+        """
         from enrolment.profiles import validate_programme_profiles
 
         errors = []
-        if _holds_mandatory_criteria(config):
+        if not on_load and _holds_mandatory_criteria(config):
             errors.append(RETIRED_MANDATORY_CRITERIA_MESSAGE)
         for field in (
             "validation_enrollment",
@@ -131,7 +137,7 @@ class EnrolmentConfig(AppConfig):
 
     def _reload_module_config(self, instance):
         config = self._merge_with_defaults(instance)
-        self._validate_config(config)
+        self._validate_config(config, on_load=True)
         self._load_config(config)
 
     @staticmethod
