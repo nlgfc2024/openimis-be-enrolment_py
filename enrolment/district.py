@@ -3,8 +3,10 @@ import re
 
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.db.models import Case, CharField, F, Value, When
 
 from core.models import InteractiveUser
+from location.apps import LocationConfig
 from location.models import Location, LocationManager, extend_allowed_locations
 
 
@@ -29,12 +31,38 @@ def district_from_condition(condition):
     from enrolment.apps import EnrolmentConfig
     if EnrolmentConfig.enable_household_district_filter is not True:
         raise ValidationError("Household district filtering is disabled.")
+    district_type = EnrolmentConfig.district_location_type
     district = Location.objects.filter(
-        id=int(value), type="R", *Location.filter_validity()
+        id=int(value), type=district_type, *Location.filter_validity()
     ).first()
     if district is None:
-        raise ValidationError("Select an active District (R).")
+        raise ValidationError(f"Select an active District ({district_type}).")
     return district
+
+
+def district_name(location_path="location"):
+    """Return the name of the district a location belongs to, as an expression.
+
+    ``location_path`` leads from the queried model to a location, for example
+    ``location`` on a household or ``individual__location`` on a membership.
+    The district is the location itself or its nearest ancestor whose type is
+    ``district_location_type``; locations without one give NULL.
+    """
+    from enrolment.apps import EnrolmentConfig
+
+    district_type = EnrolmentConfig.district_location_type
+    paths = [
+        location_path + "__parent" * depth
+        for depth in range(len(LocationConfig.location_types) or 1)
+    ]
+    return Case(
+        *(
+            When(**{f"{path}__type": district_type}, then=F(f"{path}__name"))
+            for path in paths
+        ),
+        default=Value(None),
+        output_field=CharField(),
+    )
 
 
 def scoped_groups(query, user):
