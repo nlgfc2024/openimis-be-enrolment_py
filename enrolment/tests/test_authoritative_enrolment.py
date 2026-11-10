@@ -722,12 +722,12 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             "cast": "int",
         }]}}}}
 
-        with patch.object(EnrolmentConfig, "programme_profiles", profiles), \
-                self.assertRaisesMessage(
-                    ValidationError,
-                    "json_ext__household_wealth_quintile (int)",
-                ):
-            rank_and_cap_queryset(queryset, benefit_plan, "ACTIVE", 0)
+        with patch.object(EnrolmentConfig, "programme_profiles", profiles):
+            with self.assertRaisesMessage(
+                ValidationError,
+                "json_ext__household_wealth_quintile (int)",
+            ):
+                rank_and_cap_queryset(queryset, benefit_plan, "ACTIVE", 0)
 
     @patch("enrolment.confirmation.confirm_individual_enrolment")
     def test_confirmation_signal_result_contains_authoritative_queryset(
