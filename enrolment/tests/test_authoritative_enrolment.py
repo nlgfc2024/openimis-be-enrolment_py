@@ -36,6 +36,7 @@ from individual.tests.test_helpers import (
     create_group,
     create_individual,
 )
+from location.models import Location
 from social_protection.tests.test_helpers import create_benefit_plan
 from social_protection.models import Beneficiary, GroupBeneficiary
 
@@ -498,8 +499,20 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                 "subject must be self when the selection_strategy.source is SELF",
             ),
             (
-                {"derived": "district", "filter": "exact", "value": "Zomba"},
-                "derived district is not supported; supported values: age",
+                {"derived": "income", "filter": "exact", "value": "High"},
+                "derived income is not supported; supported values: age, district",
+            ),
+            (
+                {"derived": "district", "filter": "exact", "type": "integer", "value": 1},
+                "type must be string for district",
+            ),
+            (
+                {"derived": "district", "filter": "gte", "value": "Zomba"},
+                "filter gte is not allowed for district",
+            ),
+            (
+                {"derived": "district", "filter": "iexact", "value": " "},
+                "value must be a district name",
             ),
             (
                 {"field": "gender", "derived": "age", "filter": "gte", "value": 1},
@@ -541,6 +554,7 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             source=HOUSEHOLD_HEAD_SOURCE,
             model=Group,
         )
+        with_condition({"derived": "district", "filter": "iexact", "value": "Zomba"})
 
     def test_configured_quota_compiles_field_condition_on_primary_worker(self):
         strategy = _normalise_selection_strategy(self._quota_strategy(
@@ -1700,6 +1714,72 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
             [poorest.id, poorer.id, richer.id],
         )
         self.assertEqual(selection["pool_size"], 5)
+
+    def test_district_quotas_place_individuals_by_their_location(self):
+        def village_in(district_name):
+            def location(kind, parent=None):
+                # Only the district level carries the district's name.
+                name = district_name if kind == "R" else f"{district_name} {kind}"
+                return Location.objects.create(
+                    type=kind, code=f"{district_name}-{kind}", name=name,
+                    parent=parent, audit_user_id=-1,
+                )
+            return location("V", location("W", location("D", location("R"))))
+
+        zomba, blantyre = village_in("DQ-Zomba"), village_in("DQ-Blantyre")
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
+            "type": "INDIVIDUAL",
+            "max_beneficiaries": 2,
+            "beneficiary_data_schema": {
+                "properties": {"quota_scope": {"type": "string"}}
+            },
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": [{
+                    "field": "quota_scope",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "district-quotas",
+                }]},
+                "enrolment_ranking": {"ACTIVE": {
+                    "order_by": ["id"],
+                    "selection_strategy": {
+                        "source": "SELF",
+                        "quotas": [
+                            {
+                                "key": name,
+                                "count": 1,
+                                "when": [{
+                                    "derived": "district",
+                                    "filter": "iexact",
+                                    "value": name,
+                                }],
+                            }
+                            for name in ("dq-zomba", "dq-blantyre")
+                        ],
+                    },
+                }},
+            },
+        })
+
+        def applicant(village):
+            return create_verified_individual(self.user.username, {
+                "location": village,
+                "json_ext": {"quota_scope": "district-quotas"},
+            })
+
+        first_zomba = applicant(zomba)
+        applicant(zomba)
+        in_blantyre = applicant(blantyre)
+
+        selection = build_individual_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+
+        # Ranked by id alone, both Zomba applicants would take the two places;
+        # each district's quota gives one to Blantyre instead.
+        self.assertEqual(
+            set(selection["selected_ids"]), {first_zomba.id, in_blantyre.id},
+        )
 
     def test_configured_count_quota_shortfall_goes_to_next_ranked(self):
         benefit_plan = self._ranked_plan(self.user.username, payload_override={
