@@ -12,6 +12,7 @@ from django.db.models import (
     F,
     FloatField,
     IntegerField,
+    Max,
     OuterRef,
     Q,
     Subquery,
@@ -19,7 +20,7 @@ from django.db.models import (
     When,
 )
 from django.db.models.fields.json import KeyTextTransform
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Coalesce
 
 from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
@@ -31,11 +32,12 @@ from enrolment.criteria import (
 )
 from enrolment.district import district_name
 from enrolment.membership import (
+    ANY_MEMBER_SUBJECT,
+    CANDIDATE_SUBJECTS,
     HEAD_SUBJECT,
     MEMBER_SUBJECTS,
     PRIMARY_WORKER_SUBJECT,
     SELF_SUBJECT,
-    authoritative_primary_worker_memberships,
 )
 
 
@@ -66,6 +68,9 @@ SOURCE_SUBJECTS = {
 # Household members whose json_ext a GROUP order_by item may read. A sort needs
 # one value per household, so any_member waits for a best-member aggregate.
 ORDER_BY_MEMBER_SUBJECTS = {HEAD_SUBJECT, PRIMARY_WORKER_SUBJECT}
+COMPONENT_KEYS = {"label", "field", "subject", "aggregate", "weight", "scoring"}
+# How the points of several household members combine into one score item.
+COMPONENT_AGGREGATES = {"max"}
 SHORTHAND_QUOTA_KEYS = {
     "female_percentage",
     "youth_percentage",
@@ -287,7 +292,58 @@ def _validate_scoring(scoring, path):
         )
 
 
-def _validate_weighted_score(weighted_score):
+def _phase_type(model):
+    return "GROUP" if model._meta.model_name == "group" else "INDIVIDUAL"
+
+
+def _component_subject(component, model, score_source):
+    """Return whose value a score component reads.
+
+    Without a ``subject``, a component reads the plan-level ``score_source``
+    (the primary worker) when one is set, and otherwise the candidate itself.
+    """
+    if component.get("subject"):
+        return component["subject"]
+    if score_source:
+        return PRIMARY_WORKER_SUBJECT
+    return CANDIDATE_SUBJECTS[_phase_type(model)]
+
+
+def _component_name(component):
+    """Name a score component in messages: its label, or subject and field."""
+    if component.get("label"):
+        return component["label"]
+    name = component.get("field")
+    return f"{component['subject']}.{name}" if component.get("subject") else name
+
+
+def _validate_component_source(component, path, model):
+    phase_type = _phase_type(model)
+    subjects = {CANDIDATE_SUBJECTS[phase_type]}
+    if phase_type == "GROUP":
+        subjects |= set(MEMBER_SUBJECTS)
+    subject = component.get("subject")
+    if subject is not None and subject not in subjects:
+        raise ValidationError(
+            f"{phase_type} {path}.subject must be one of "
+            + ", ".join(sorted(subjects)) + "."
+        )
+    aggregate = component.get("aggregate")
+    if subject == ANY_MEMBER_SUBJECT:
+        if aggregate not in COMPONENT_AGGREGATES:
+            raise ValidationError(
+                f"{path}.aggregate must be one of "
+                + ", ".join(sorted(COMPONENT_AGGREGATES))
+                + " when subject is any_member."
+            )
+    elif aggregate is not None:
+        raise ValidationError(f"{path}.aggregate is only used with subject any_member.")
+    label = component.get("label")
+    if label is not None and (not isinstance(label, str) or not label.strip()):
+        raise ValidationError(f"{path}.label must be a non-empty string.")
+
+
+def _validate_weighted_score(weighted_score, model, score_source=None):
     if not isinstance(weighted_score, dict):
         raise ValidationError("enrolment_ranking.weighted_score must be an object.")
     unexpected = set(weighted_score) - {"normalise_to", "components"}
@@ -312,23 +368,27 @@ def _validate_weighted_score(weighted_score):
         raise ValidationError(
             "enrolment_ranking.weighted_score.components must be a non-empty list."
         )
-    fields = set()
+    sources = set()
     for index, component in enumerate(components):
         path = f"enrolment_ranking.weighted_score.components[{index}]"
         if not isinstance(component, dict):
             raise ValidationError(f"{path} must be an object.")
-        unexpected_component = set(component) - {"field", "weight", "scoring"}
+        unexpected_component = set(component) - COMPONENT_KEYS
         if unexpected_component:
             raise ValidationError(
                 f"Unsupported {path} keys: "
                 f"{', '.join(sorted(unexpected_component))}."
             )
+        _validate_component_source(component, path, model)
         field = component.get("field")
         if not isinstance(field, str) or not field:
             raise ValidationError(f"{path}.field must be a non-empty string.")
-        if field in fields:
-            raise ValidationError(f"Duplicate weighted score field: {field}.")
-        fields.add(field)
+        source = (_component_subject(component, model, score_source), field)
+        if source in sources:
+            raise ValidationError(
+                f"Duplicate weighted score field: {_component_name(component)}."
+            )
+        sources.add(source)
         _positive_number(component.get("weight"), f"{path}.weight")
         _validate_scoring(component.get("scoring"), f"{path}.scoring")
     total_points = sum(
@@ -618,7 +678,7 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         )
     _validate_score_source(score_source, model)
     if weighted_score is not None:
-        _validate_weighted_score(weighted_score)
+        _validate_weighted_score(weighted_score, model, score_source)
     if ranking.get("selection_strategy") is not None:
         _normalise_selection_strategy(ranking["selection_strategy"], model)
 
@@ -679,9 +739,13 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
     respect_max = limit.get("respect_max_beneficiaries", True)
     if not isinstance(respect_max, bool):
         raise ValidationError("enrolment_ranking.limit.respect_max_beneficiaries must be boolean.")
-    if weighted_score is not None and not score_source and schema_fields:
+    if weighted_score is not None and schema_fields:
+        candidate_subject = CANDIDATE_SUBJECTS[_phase_type(model)]
         for index, component in enumerate(weighted_score["components"]):
-            if component["field"] not in schema_fields:
+            if (
+                _component_subject(component, model, score_source) == candidate_subject
+                and component["field"] not in schema_fields
+            ):
                 raise ValidationError(
                     "enrolment_ranking.weighted_score.components"
                     f"[{index}].field {component['field']} is not defined in "
@@ -738,56 +802,89 @@ def _maximum_points(scoring):
     return max([scoring.get("default", 0), *points])
 
 
-def _score_source_expression(field, score_source):
-    if not score_source:
-        return KeyTextTransform(field, "json_ext")
+def _component_value(component, subject, model):
+    """Return the value a score component reads, for one candidate or member.
 
-    primary_worker = authoritative_primary_worker_memberships().filter(
+    The candidate's own value comes from its json_ext; a head or primary
+    worker's from that member's json_ext.
+    """
+    field = component["field"]
+    if subject == CANDIDATE_SUBJECTS[_phase_type(model)]:
+        value = KeyTextTransform(field, "json_ext")
+    else:
+        value = Subquery(
+            _household_member(subject).annotate(
+                _score_value=KeyTextTransform(field, "individual__json_ext")
+            ).values("_score_value")[:1],
+            output_field=CharField(),
+        )
+    if component["scoring"]["type"] == "numeric_bands":
+        value = Cast(value, output_field=FloatField())
+    return value
+
+
+def _points_case(value_alias, scoring):
+    """Turn the value annotated as ``value_alias`` into the component's points."""
+    if scoring["type"] == "mapping":
+        cases = [
+            When(**{value_alias: value}, then=Value(float(points)))
+            for value, points in scoring["values"].items()
+        ]
+    else:
+        cases = []
+        for band in scoring["bands"]:
+            conditions = {}
+            if "min" in band:
+                conditions[f"{value_alias}__gte"] = band["min"]
+            if "max" in band:
+                conditions[f"{value_alias}__lte"] = band["max"]
+            cases.append(When(**conditions, then=Value(float(band["points"]))))
+    return Case(
+        *cases,
+        default=Value(float(scoring.get("default", 0))),
+        output_field=FloatField(),
+    )
+
+
+def _best_member_points(component):
+    """Score every household member and keep the best member's points."""
+    value = KeyTextTransform(component["field"], "individual__json_ext")
+    if component["scoring"]["type"] == "numeric_bands":
+        value = Cast(value, output_field=FloatField())
+    best = MEMBER_SUBJECTS[ANY_MEMBER_SUBJECT]().filter(
         group_id=OuterRef("pk")
-    ).order_by("id")
-    value = KeyTextTransform(field, "individual__json_ext")
-    return Subquery(
-        primary_worker.annotate(_score_value=value).values("_score_value")[:1],
-        output_field=CharField(),
+    ).annotate(
+        _score_value=value,
+    ).annotate(
+        _score_points=_points_case("_score_value", component["scoring"]),
+    ).values("group_id").annotate(
+        _best_points=Max("_score_points"),
+    ).values("_best_points")
+    # A household without members scores the component's default.
+    return Coalesce(
+        Subquery(best[:1], output_field=FloatField()),
+        Value(float(component["scoring"].get("default", 0))),
+        output_field=FloatField(),
     )
 
 
 def build_weighted_score(queryset, weighted_score, score_source=None):
     """Annotate a normalized score in SQL without loading the pool into Python."""
+    model = queryset.model
     source_annotations = {}
-    for index, component in enumerate(weighted_score["components"]):
-        expression = _score_source_expression(component["field"], score_source)
-        if component["scoring"]["type"] == "numeric_bands":
-            expression = Cast(expression, output_field=FloatField())
-        source_annotations[f"_enrolment_score_source_{index}"] = expression
-    scored = queryset.annotate(**source_annotations)
-
     component_annotations = {}
     for index, component in enumerate(weighted_score["components"]):
-        scoring = component["scoring"]
+        subject = _component_subject(component, model, score_source)
+        component_alias = f"_enrolment_score_component_{index}"
+        if subject == ANY_MEMBER_SUBJECT:
+            component_annotations[component_alias] = _best_member_points(component)
+            continue
         source_alias = f"_enrolment_score_source_{index}"
-        if scoring["type"] == "mapping":
-            cases = [
-                When(**{source_alias: value}, then=Value(float(points)))
-                for value, points in scoring["values"].items()
-            ]
-        else:
-            cases = []
-            for band in scoring["bands"]:
-                conditions = {}
-                if "min" in band:
-                    conditions[f"{source_alias}__gte"] = band["min"]
-                if "max" in band:
-                    conditions[f"{source_alias}__lte"] = band["max"]
-                cases.append(
-                    When(**conditions, then=Value(float(band["points"])))
-                )
-        component_annotations[f"_enrolment_score_component_{index}"] = Case(
-            *cases,
-            default=Value(float(scoring.get("default", 0))),
-            output_field=FloatField(),
+        source_annotations[source_alias] = _component_value(component, subject, model)
+        component_annotations[component_alias] = _points_case(
+            source_alias, component["scoring"]
         )
-    scored = scored.annotate(**component_annotations)
+    scored = queryset.annotate(**source_annotations).annotate(**component_annotations)
 
     weighted_total = Value(0.0, output_field=FloatField())
     total_weight = 0.0
@@ -1021,7 +1118,7 @@ def _cast_error(order_items, exc, weighted_score=None):
     )
     if weighted_score:
         weighted_fields = ", ".join(
-            component["field"]
+            _component_name(component)
             for component in weighted_score.get("components", [])
             if component.get("scoring", {}).get("type") == "numeric_bands"
         )

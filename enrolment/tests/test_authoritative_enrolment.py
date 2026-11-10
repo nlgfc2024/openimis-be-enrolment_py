@@ -556,6 +556,49 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
         )
         with_condition({"derived": "district", "filter": "iexact", "value": "Zomba"})
 
+    def _ranking_with_component(self, **component):
+        return {
+            "weighted_score": {"components": [{
+                "field": "savings_experience",
+                "weight": 3,
+                "scoring": {"type": "mapping", "values": {"Active": 3}},
+                **component,
+            }]},
+            "order_by": [{"field": "_weighted_score", "direction": "desc"}],
+        }
+
+    def test_score_component_subjects_are_validated(self):
+        cases = [
+            (Individual, {"subject": "head"},
+             "INDIVIDUAL enrolment_ranking.weighted_score.components[0].subject must be one of self."),
+            (Group, {"subject": "self"}, "subject must be one of any_member, head, household, primary_worker."),
+            (Group, {"subject": "any_member"}, "aggregate must be one of max when subject is any_member."),
+            (Group, {"subject": "any_member", "aggregate": "sum"}, "aggregate must be one of max"),
+            (Group, {"subject": "head", "aggregate": "max"}, "aggregate is only used with subject any_member."),
+            (Group, {"label": " "}, "label must be a non-empty string."),
+        ]
+        for model, component, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesMessage(ValidationError, message):
+                    validate_ranking_spec(self._ranking_with_component(**component), model)
+
+        ranking = self._ranking_with_component(
+            subject="any_member", aggregate="max", label="Savings experience",
+        )
+        ranking["weighted_score"]["components"].append({
+            "subject": "head", "field": "savings_experience", "weight": 3,
+            "scoring": {"type": "mapping", "values": {"Active": 3}},
+        })
+        # The same field read from two subjects is two different score items.
+        validate_ranking_spec(ranking, Group)
+
+        ranking["weighted_score"]["components"][1]["subject"] = "any_member"
+        ranking["weighted_score"]["components"][1]["aggregate"] = "max"
+        with self.assertRaisesMessage(
+            ValidationError, "Duplicate weighted score field: any_member.savings_experience."
+        ):
+            validate_ranking_spec(ranking, Group)
+
     def test_configured_quota_compiles_field_condition_on_primary_worker(self):
         strategy = _normalise_selection_strategy(self._quota_strategy(
             [self._business_quota()], source="PRIMARY_WORKER",
@@ -1464,6 +1507,77 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         self.assertEqual(
             list(selection["groups_not_assigned_to_selected_programme"].values_list("id", flat=True))[:2],
             [first.id, second.id],
+        )
+
+    def test_group_score_component_takes_the_best_household_member(self):
+        benefit_plan = self._ranked_plan(self.user.username, payload_override={
+            "type": "GROUP",
+            "max_beneficiaries": 1,
+            "beneficiary_data_schema": {
+                "properties": {"test_scope": {"type": "string"}}
+            },
+            "json_ext": {
+                "advanced_criteria": {"ACTIVE": [{
+                    "field": "test_scope",
+                    "filter": "exact",
+                    "type": "string",
+                    "value": "best-member",
+                }]},
+                "enrolment_ranking": {"ACTIVE": {
+                    "weighted_score": {
+                        "normalise_to": 3,
+                        "components": [{
+                            "label": "Savings experience",
+                            "subject": "any_member",
+                            "aggregate": "max",
+                            "field": "savings_experience",
+                            "weight": 3,
+                            "scoring": {"type": "mapping", "values": {
+                                "Active": 3, "Inactive": 2, "None": 1,
+                            }},
+                        }],
+                    },
+                    "order_by": [{"field": "_weighted_score", "direction": "desc"}],
+                }},
+            },
+        })
+        group_json = {"test_scope": "best-member"}
+        inactive = self._verified_group(
+            json_ext=group_json, individual_json_ext={"savings_experience": "Inactive"},
+        )
+        # The primary worker scores lowest, but a second member is active.
+        with_active_member = self._verified_group(
+            json_ext=group_json, individual_json_ext={"savings_experience": "None"},
+        )
+        add_individual_to_group(
+            self.user.username,
+            create_verified_individual(self.user.username, {
+                "json_ext": {"savings_experience": "Active"},
+            }),
+            with_active_member,
+            is_head=False,
+        )
+        # Saving a membership copies the head's json_ext onto the household and
+        # drops its keys, so restore them.
+        with_active_member.refresh_from_db()
+        with_active_member.json_ext = {
+            **(with_active_member.json_ext or {}), **group_json,
+            "validation_status": "VERIFIED",
+        }
+        with_active_member.save(username=self.user.username)
+
+        scores = dict(build_weighted_score(
+            Group.objects.filter(id__in=[inactive.id, with_active_member.id]),
+            EnrolmentConfig.programme_profiles[benefit_plan.code]["ranking"]["ACTIVE"]["weighted_score"],
+        ).values_list("id", "_weighted_score"))
+        self.assertEqual(scores, {inactive.id: 2.0, with_active_member.id: 3.0})
+
+        selection = build_group_enrollment_selection(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+        self.assertEqual(
+            list(selection["groups_not_assigned_to_selected_programme"].values_list("id", flat=True)),
+            [with_active_member.id],
         )
 
     def test_group_weighted_ranking_reads_primary_worker_business_data(self):
