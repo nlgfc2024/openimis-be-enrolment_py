@@ -35,6 +35,7 @@ from enrolment.membership import (
     ANY_MEMBER_SUBJECT,
     CANDIDATE_SUBJECTS,
     HEAD_SUBJECT,
+    HOUSEHOLD_SUBJECT,
     MEMBER_SUBJECTS,
     PRIMARY_WORKER_SUBJECT,
     SELF_SUBJECT,
@@ -68,7 +69,10 @@ SOURCE_SUBJECTS = {
 # Household members whose json_ext a GROUP order_by item may read. A sort needs
 # one value per household, so any_member waits for a best-member aggregate.
 ORDER_BY_MEMBER_SUBJECTS = {HEAD_SUBJECT, PRIMARY_WORKER_SUBJECT}
-COMPONENT_KEYS = {"label", "field", "subject", "aggregate", "weight", "scoring"}
+COMPONENT_KEYS = {"label", "field", "derived", "subject", "aggregate", "weight", "scoring"}
+# Derived values a score component may read instead of a json_ext field, with
+# the scoring type each needs: age in whole years, district by name.
+DERIVED_SCORE_VALUES = {"age": "numeric_bands", "district": "mapping"}
 # How the points of several household members combine into one score item.
 COMPONENT_AGGREGATES = {"max"}
 SHORTHAND_QUOTA_KEYS = {
@@ -313,7 +317,7 @@ def _component_name(component):
     """Name a score component in messages: its label, or subject and field."""
     if component.get("label"):
         return component["label"]
-    name = component.get("field")
+    name = component.get("field") or component.get("derived")
     return f"{component['subject']}.{name}" if component.get("subject") else name
 
 
@@ -341,6 +345,32 @@ def _validate_component_source(component, path, model):
     label = component.get("label")
     if label is not None and (not isinstance(label, str) or not label.strip()):
         raise ValidationError(f"{path}.label must be a non-empty string.")
+
+
+def _validate_derived_component(component, path, subject):
+    derived = component["derived"]
+    if derived not in DERIVED_SCORE_VALUES:
+        raise ValidationError(
+            f"{path}.derived {derived} is not supported; supported values: "
+            + ", ".join(sorted(DERIVED_SCORE_VALUES)) + "."
+        )
+    scoring = component.get("scoring")
+    scoring_type = DERIVED_SCORE_VALUES[derived]
+    if isinstance(scoring, dict) and scoring.get("type") != scoring_type:
+        raise ValidationError(f"{path}.scoring.type must be {scoring_type} for {derived}.")
+    if derived == "age":
+        if subject == HOUSEHOLD_SUBJECT:
+            raise ValidationError(
+                f"{path}.derived age needs a person: set subject to head, "
+                "primary_worker or any_member."
+            )
+        for index, band in enumerate((scoring or {}).get("bands") or []):
+            for bound in ("min", "max"):
+                if bound in band and type(band[bound]) is not int:
+                    raise ValidationError(
+                        f"{path}.scoring.bands[{index}].{bound} must be a whole "
+                        "number of years."
+                    )
 
 
 def _validate_weighted_score(weighted_score, model, score_source=None):
@@ -380,10 +410,16 @@ def _validate_weighted_score(weighted_score, model, score_source=None):
                 f"{', '.join(sorted(unexpected_component))}."
             )
         _validate_component_source(component, path, model)
-        field = component.get("field")
-        if not isinstance(field, str) or not field:
-            raise ValidationError(f"{path}.field must be a non-empty string.")
-        source = (_component_subject(component, model, score_source), field)
+        subject = _component_subject(component, model, score_source)
+        if ("field" in component) == ("derived" in component):
+            raise ValidationError(f"{path} must set exactly one of field or derived.")
+        if "derived" in component:
+            _validate_derived_component(component, path, subject)
+        else:
+            field = component["field"]
+            if not isinstance(field, str) or not field:
+                raise ValidationError(f"{path}.field must be a non-empty string.")
+        source = (subject, component.get("field") or component["derived"])
         if source in sources:
             raise ValidationError(
                 f"Duplicate weighted score field: {_component_name(component)}."
@@ -743,7 +779,8 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         candidate_subject = CANDIDATE_SUBJECTS[_phase_type(model)]
         for index, component in enumerate(weighted_score["components"]):
             if (
-                _component_subject(component, model, score_source) == candidate_subject
+                "field" in component
+                and _component_subject(component, model, score_source) == candidate_subject
                 and component["field"] not in schema_fields
             ):
                 raise ValidationError(
@@ -802,29 +839,50 @@ def _maximum_points(scoring):
     return max([scoring.get("default", 0), *points])
 
 
-def _component_value(component, subject, model):
-    """Return the value a score component reads, for one candidate or member.
+def _value_expression(component, prefix=""):
+    """Return the value a component reads, from the person or household at ``prefix``.
 
-    The candidate's own value comes from its json_ext; a head or primary
-    worker's from that member's json_ext.
+    ``prefix`` is empty for the candidate itself and ``individual__`` from a
+    household membership.
     """
-    field = component["field"]
-    if subject == CANDIDATE_SUBJECTS[_phase_type(model)]:
-        value = KeyTextTransform(field, "json_ext")
-    else:
-        value = Subquery(
-            _household_member(subject).annotate(
-                _score_value=KeyTextTransform(field, "individual__json_ext")
-            ).values("_score_value")[:1],
-            output_field=CharField(),
-        )
+    derived = component.get("derived")
+    if derived == "age":
+        return F(f"{prefix}dob")
+    if derived == "district":
+        return district_name(f"{prefix}location")
+    value = KeyTextTransform(component["field"], f"{prefix}json_ext")
     if component["scoring"]["type"] == "numeric_bands":
         value = Cast(value, output_field=FloatField())
     return value
 
 
-def _points_case(value_alias, scoring):
+def _value_output_field(component):
+    if component.get("derived") == "age":
+        return DateField()
+    if "field" in component and component["scoring"]["type"] == "numeric_bands":
+        return FloatField()
+    return CharField()
+
+
+def _component_value(component, subject, model):
+    """Return the value a score component reads for a candidate.
+
+    The candidate's own value comes from its record; a head or primary
+    worker's from that member's record.
+    """
+    if subject == CANDIDATE_SUBJECTS[_phase_type(model)]:
+        return _value_expression(component)
+    return Subquery(
+        _household_member(subject).annotate(
+            _score_value=_value_expression(component, "individual__")
+        ).values("_score_value")[:1],
+        output_field=_value_output_field(component),
+    )
+
+
+def _points_case(value_alias, component):
     """Turn the value annotated as ``value_alias`` into the component's points."""
+    scoring = component["scoring"]
     if scoring["type"] == "mapping":
         cases = [
             When(**{value_alias: value}, then=Value(float(points)))
@@ -833,12 +891,21 @@ def _points_case(value_alias, scoring):
     else:
         cases = []
         for band in scoring["bands"]:
-            conditions = {}
-            if "min" in band:
-                conditions[f"{value_alias}__gte"] = band["min"]
-            if "max" in band:
-                conditions[f"{value_alias}__lte"] = band["max"]
-            cases.append(When(**conditions, then=Value(float(band["points"]))))
+            if component.get("derived") == "age":
+                # Ages compare as date-of-birth ranges on the enrolment date.
+                condition = Q()
+                if "min" in band:
+                    condition &= _age_condition_q(value_alias, "gte", band["min"])
+                if "max" in band:
+                    condition &= _age_condition_q(value_alias, "lte", band["max"])
+            else:
+                lookups = {}
+                if "min" in band:
+                    lookups[f"{value_alias}__gte"] = band["min"]
+                if "max" in band:
+                    lookups[f"{value_alias}__lte"] = band["max"]
+                condition = Q(**lookups)
+            cases.append(When(condition, then=Value(float(band["points"]))))
     return Case(
         *cases,
         default=Value(float(scoring.get("default", 0))),
@@ -848,15 +915,12 @@ def _points_case(value_alias, scoring):
 
 def _best_member_points(component):
     """Score every household member and keep the best member's points."""
-    value = KeyTextTransform(component["field"], "individual__json_ext")
-    if component["scoring"]["type"] == "numeric_bands":
-        value = Cast(value, output_field=FloatField())
     best = MEMBER_SUBJECTS[ANY_MEMBER_SUBJECT]().filter(
         group_id=OuterRef("pk")
     ).annotate(
-        _score_value=value,
+        _score_value=_value_expression(component, "individual__"),
     ).annotate(
-        _score_points=_points_case("_score_value", component["scoring"]),
+        _score_points=_points_case("_score_value", component),
     ).values("group_id").annotate(
         _best_points=Max("_score_points"),
     ).values("_best_points")
@@ -881,9 +945,7 @@ def build_weighted_score(queryset, weighted_score, score_source=None):
             continue
         source_alias = f"_enrolment_score_source_{index}"
         source_annotations[source_alias] = _component_value(component, subject, model)
-        component_annotations[component_alias] = _points_case(
-            source_alias, component["scoring"]
-        )
+        component_annotations[component_alias] = _points_case(source_alias, component)
     scored = queryset.annotate(**source_annotations).annotate(**component_annotations)
 
     weighted_total = Value(0.0, output_field=FloatField())
