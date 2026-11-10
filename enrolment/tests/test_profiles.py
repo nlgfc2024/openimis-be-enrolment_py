@@ -1,6 +1,7 @@
 import copy
 from unittest.mock import Mock, patch
 
+from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 
@@ -187,20 +188,34 @@ class ProgrammeProfileResolutionTest(SimpleTestCase):
 
     def test_retired_mandatory_criteria_are_rejected_on_save_and_logged_on_load(self):
         retired = {"INDIVIDUAL": {}, "GROUP": {"ACTIVE": [_criterion()]}}
-        config = {**copy.deepcopy(DEFAULT_CONFIG), "mandatory_enrollment_criteria": retired}
+        app = apps.get_app_config("enrolment")
+        instance = Mock(_cfg={"mandatory_enrollment_criteria": retired})
+        loaded = {field: getattr(EnrolmentConfig, field) for field in DEFAULT_CONFIG}
+        self.addCleanup(lambda: [setattr(EnrolmentConfig, f, v) for f, v in loaded.items()])
+
+        # Saving a configuration that still sets criteria is rejected.
         with self.assertRaisesMessage(
             ValidationError, "mandatory_enrollment_criteria is no longer applied"
         ):
-            EnrolmentConfig._validate_config(config)
-        with self.assertLogs("enrolment.apps", "WARNING") as logs:
-            EnrolmentConfig._load_config(config)
-        self.assertIn("programme profile's eligibility.criteria", logs.output[0])
+            app._validate_module_config(instance)
+
+        # One already stored does not stop startup or a reload; it is logged.
+        stored = {**copy.deepcopy(DEFAULT_CONFIG), "mandatory_enrollment_criteria": retired}
+        with patch("core.models.ModuleConfiguration.get_or_default", return_value=stored), \
+                patch("enrolment.apps.register_validator"), \
+                patch("enrolment.apps.register_reloader"), \
+                patch.object(EnrolmentConfig, "_register_benefit_plan_validator"), \
+                self.assertLogs("enrolment.apps", "WARNING") as startup_logs:
+            app.ready()
+        self.assertIn("programme profile's eligibility.criteria", startup_logs.output[0])
+        with self.assertLogs("enrolment.apps", "WARNING") as reload_logs:
+            app._reload_module_config(instance)
+        self.assertIn("programme profile's eligibility.criteria", reload_logs.output[0])
 
         # The empty shape older configurations carry still saves.
-        EnrolmentConfig._validate_config({
-            **copy.deepcopy(DEFAULT_CONFIG),
+        app._validate_module_config(Mock(_cfg={
             "mandatory_enrollment_criteria": {"INDIVIDUAL": {}, "GROUP": {}},
-        })
+        }))
 
     def test_no_profile_applies_without_match_or_default(self):
         with patch.object(EnrolmentConfig, "programme_profiles", {"RMEP": {}}):
