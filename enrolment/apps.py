@@ -30,6 +30,8 @@ DEFAULT_CONFIG = {
     "registry_primary_worker_field": "primary_worker",
     "registry_household_verification_field": "validation_status",
     "registry_verified_household_value": "VERIFIED",
+    "registry_individual_verification_field": "validation_status",
+    "registry_verified_individual_value": "VERIFIED",
     "bulk_enrollment_batch_size": 1000,
     "max_enrolment_score": 100,
     # Eligibility and ranking rules shared by a programme's Phases, keyed by
@@ -53,6 +55,8 @@ class EnrolmentConfig(AppConfig):
     registry_primary_worker_field = None
     registry_household_verification_field = None
     registry_verified_household_value = None
+    registry_individual_verification_field = None
+    registry_verified_individual_value = None
     bulk_enrollment_batch_size = None
     max_enrolment_score = None
     programme_profiles = None
@@ -91,6 +95,8 @@ class EnrolmentConfig(AppConfig):
             "registry_primary_worker_field",
             "registry_household_verification_field",
             "registry_verified_household_value",
+            "registry_individual_verification_field",
+            "registry_verified_individual_value",
         ):
             if not isinstance(config.get(field), str) or not config[field].strip():
                 errors.append(f"{field} must be a non-empty string.")

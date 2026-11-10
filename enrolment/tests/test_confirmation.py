@@ -9,14 +9,13 @@ from enrolment.services import (
     build_individual_enrolment_selection,
 )
 from enrolment.schema import Mutation as EnrolmentMutation, Query as EnrolmentQuery
-from enrolment.tests.helpers import ProfileRankingMixin
+from enrolment.tests.helpers import ProfileRankingMixin, create_verified_individual
 from individual.models import IndividualDataSource
 from individual.schema import Mutation as IndividualMutation, Query as IndividualQuery
 from individual.tests.test_helpers import (
     BaseTestContext,
     IndividualGQLTestCase,
     create_group_with_individual,
-    create_individual,
 )
 from social_protection.models import (
     Beneficiary,
@@ -112,7 +111,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_direct_individual_confirmation_persists_once(self):
         plan = self._plan("INDIVIDUAL", "direct-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "direct-individual"}},
         )
@@ -163,7 +162,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_individual_maker_checker_stages_one_pending_workflow(self):
         plan = self._plan("INDIVIDUAL", "maker-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "maker-individual"}},
         )
@@ -239,7 +238,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_approved_individual_workflow_persists_beneficiary(self, _synchronize):
         plan = self._plan("INDIVIDUAL", "approved-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "approved-individual"}},
         )
@@ -282,7 +281,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
         token = "percentage-individual"
         plan = self._percentage_plan("INDIVIDUAL", token)
         for _ in range(10):
-            create_individual(
+            create_verified_individual(
                 self.admin_user.username,
                 {"json_ext": {"enrolment_test": token}},
             )
@@ -335,7 +334,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_approval_failure_rolls_back_beneficiary_and_fails_task(self, _sync):
         plan = self._plan("INDIVIDUAL", "rollback-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "rollback-individual"}},
         )
@@ -364,7 +363,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_approval_rejects_candidate_enrolled_while_pending(self):
         plan = self._plan("INDIVIDUAL", "duplicate-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "duplicate-individual"}},
         )
@@ -398,7 +397,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_approval_rejects_candidate_that_becomes_ineligible(self):
         plan = self._plan("INDIVIDUAL", "eligible-while-staged")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "eligible-while-staged"}},
         )
@@ -452,7 +451,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
                 },
             },
         )
-        staged = create_individual(
+        staged = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": token}},
         )
@@ -463,7 +462,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
             benefit_plan=plan, workflow="Enrollment", is_deleted=False
         )
         task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
-        other = create_individual(self.admin_user.username)
+        other = create_verified_individual(self.admin_user.username)
         Beneficiary(
             individual=other,
             benefit_plan=plan,
@@ -651,7 +650,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_new_graphql_mutation_confirms_individual_enrolment(self):
         plan = self._plan("INDIVIDUAL", "graphql-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "graphql-individual"}},
         )
@@ -710,7 +709,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     )
     def test_graphql_individual_confirmation_starts_approval_workflow(self):
         plan = self._plan("INDIVIDUAL", "graphql-maker-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "graphql-maker-individual"}},
         )
@@ -814,7 +813,7 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
             "message": "workflow unavailable",
         }
         plan = self._plan("INDIVIDUAL", "maker-failure")
-        create_individual(
+        create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "maker-failure"}},
         )

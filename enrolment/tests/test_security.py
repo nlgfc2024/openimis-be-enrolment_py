@@ -14,11 +14,11 @@ from enrolment.services import (
     build_individual_enrolment_selection,
     build_individual_enrolment_summary,
 )
+from enrolment.tests.helpers import create_verified_individual
 from individual.models import Group, Individual
 from individual.tests.test_helpers import (
     IndividualGQLTestCase,
     create_group,
-    create_individual,
     add_individual_to_group,
 )
 from social_protection.tests.test_helpers import create_benefit_plan
@@ -70,10 +70,10 @@ class EnrolmentRowSecurityTest(IndividualGQLTestCase):
                 "json_ext": {"advanced_criteria": {"ACTIVE": []}},
             },
         )
-        cls.individual_a = create_individual(
+        cls.individual_a = create_verified_individual(
             cls.admin_user.username, {"location": cls.village_a}
         )
-        cls.individual_b = create_individual(
+        cls.individual_b = create_verified_individual(
             cls.admin_user.username, {"location": cls.village_b}
         )
         cls.group_a = create_group(
@@ -85,7 +85,7 @@ class EnrolmentRowSecurityTest(IndividualGQLTestCase):
             {"location": cls.village_b, "json_ext": {"validation_status": "VERIFIED"}},
         )
         for group in (cls.group_a, cls.group_b):
-            individual = create_individual(
+            individual = create_verified_individual(
                 cls.admin_user.username, {"location": group.location}
             )
             membership = add_individual_to_group(

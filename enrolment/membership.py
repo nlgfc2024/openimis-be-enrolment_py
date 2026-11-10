@@ -55,6 +55,15 @@ MEMBER_SUBJECTS = {
 }
 
 
+def verified_individual_filter():
+    """Build the filter for individuals the registry marks as verified."""
+    return Q(**{
+        f"json_ext__{EnrolmentConfig.registry_individual_verification_field}": (
+            EnrolmentConfig.registry_verified_individual_value
+        ),
+    })
+
+
 def primary_worker_membership_filter(prefix="groupindividuals"):
     """Build the equivalent relation filter for Group queryset annotations."""
     return Q(
