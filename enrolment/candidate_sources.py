@@ -10,6 +10,7 @@ from enrolment.district import apply_district_filters, scoped_groups
 from enrolment.membership import (
     active_household_memberships,
     primary_worker_membership_filter,
+    verified_individual_filter,
 )
 from enrolment.profiles import apply_profile_eligibility
 
@@ -31,7 +32,10 @@ class IndividualCandidateSource:
         # pagination so no later operation can widen the authorized population.
         query = self.authorized_queryset(user)
         benefit_plan = benefit_plan or load_enrolment_phase(benefit_plan_id, status, self.phase_type)
-        query = query.filter(data_source_q(benefit_plan_data_source(benefit_plan)))
+        query = query.filter(
+            data_source_q(benefit_plan_data_source(benefit_plan)),
+            verified_individual_filter(),
+        )
         filters = merge_enrolment_criteria(
             custom_filters,
             benefit_plan_id,

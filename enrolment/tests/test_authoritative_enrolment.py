@@ -29,7 +29,7 @@ from enrolment.ranking import (
 )
 from individual.models import Group, GroupIndividual, Individual
 from enrolment.schema import Query
-from enrolment.tests.helpers import ProfileRankingMixin
+from enrolment.tests.helpers import ProfileRankingMixin, create_verified_individual
 from individual.custom_filters import GroupCustomFilterWizard, IndividualCustomFilterWizard
 from individual.tests.test_helpers import (
     add_individual_to_group,
@@ -836,7 +836,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         individual_data = {"json_ext": individual_json_ext or {}}
         if dob is not None:
             individual_data["dob"] = dob
-        individual = create_individual(self.user.username, individual_data)
+        individual = create_verified_individual(self.user.username, individual_data)
         membership = add_individual_to_group(
             self.user.username, individual, group
         )
@@ -893,18 +893,18 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
                 },
             },
         )
-        create_individual(self.user.username, {
+        create_verified_individual(self.user.username, {
             "dob": date(date.today().year - 50, 1, 1),
             "json_ext": {"gender": "Male"},
         })
         selected = []
         for age in (25, 30):
-            selected.append(create_individual(self.user.username, {
+            selected.append(create_verified_individual(self.user.username, {
                 "dob": date(date.today().year - age, 1, 1),
                 "json_ext": {"gender": "Male"},
             }))
         for age in (40, 45, 50):
-            selected.append(create_individual(self.user.username, {
+            selected.append(create_verified_individual(self.user.username, {
                 "dob": date(date.today().year - age, 1, 1),
                 "json_ext": {"gender": "Female"},
             }))
@@ -955,7 +955,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         )
 
     def _quota_candidate(self, rank, gender="Male", age=50):
-        return create_individual(self.user.username, {
+        return create_verified_individual(self.user.username, {
             "dob": date(date.today().year - age, 1, 1),
             "json_ext": {
                 "gender": gender,
@@ -1098,13 +1098,13 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
 
     def test_individual_confirmation_cannot_omit_phase_criteria(self):
         benefit_plan = self._benefit_plan("INDIVIDUAL")
-        eligible = create_individual(self.user.username, {
+        eligible = create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "VERIFIED",
                 "district": "Lilongwe",
             }
         })
-        create_individual(self.user.username, {
+        create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "PENDING",
                 "district": "Lilongwe",
@@ -1123,19 +1123,19 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
 
     def test_operator_filter_can_only_narrow_phase_results(self):
         benefit_plan = self._benefit_plan("INDIVIDUAL")
-        selected = create_individual(self.user.username, {
+        selected = create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "VERIFIED",
                 "district": "Lilongwe",
             }
         })
-        create_individual(self.user.username, {
+        create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "VERIFIED",
                 "district": "Blantyre",
             }
         })
-        create_individual(self.user.username, {
+        create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "PENDING",
                 "district": "Lilongwe",
@@ -1162,19 +1162,19 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
             }]}},
         }))
         benefit_plan = self._benefit_plan("INDIVIDUAL")
-        selected = create_individual(self.user.username, {
+        selected = create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "VERIFIED",
                 "district": "Lilongwe",
             }
         })
-        create_individual(self.user.username, {
+        create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "VERIFIED",
                 "district": "Blantyre",
             }
         })
-        create_individual(self.user.username, {
+        create_verified_individual(self.user.username, {
             "json_ext": {
                 "validation_status": "PENDING",
                 "district": "Lilongwe",
@@ -1189,6 +1189,26 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         )
 
         self.assertEqual(set(result.values_list("id", flat=True)), {selected.id})
+
+    def test_individual_phase_enrols_only_verified_individuals(self):
+        benefit_plan = create_benefit_plan(self.user.username, payload_override={
+            "type": "INDIVIDUAL",
+            "json_ext": {"advanced_criteria": {"ACTIVE": []}},
+        })
+        verified = create_verified_individual(self.user.username)
+        create_verified_individual(self.user.username, {
+            "json_ext": {"validation_status": "PENDING"},
+        })
+        create_individual(self.user.username, {"json_ext": {}})
+
+        result = build_individual_enrollment_queryset(
+            custom_filters=[],
+            benefit_plan_id=str(benefit_plan.id),
+            status="ACTIVE",
+            user=self.user,
+        )
+
+        self.assertEqual(set(result.values_list("id", flat=True)), {verified.id})
 
     def test_rejects_operator_filter_outside_phase_schema(self):
         benefit_plan = self._benefit_plan("INDIVIDUAL")
@@ -1295,9 +1315,9 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
                 }
             },
         })
-        ranked = create_individual(self.user.username, {"json_ext": {"score": "9"}})
-        second = create_individual(self.user.username, {"json_ext": {"score": "10"}})
-        create_individual(self.user.username, {"json_ext": {"score": "100"}})
+        ranked = create_verified_individual(self.user.username, {"json_ext": {"score": "9"}})
+        second = create_verified_individual(self.user.username, {"json_ext": {"score": "10"}})
+        create_verified_individual(self.user.username, {"json_ext": {"score": "100"}})
 
         selection = build_individual_enrollment_selection(
             [], str(benefit_plan.id), "ACTIVE", self.user
@@ -1330,9 +1350,9 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
                 }
             },
         })
-        first = create_individual(self.user.username)
-        second = create_individual(self.user.username)
-        create_individual(self.user.username)
+        first = create_verified_individual(self.user.username)
+        second = create_verified_individual(self.user.username)
+        create_verified_individual(self.user.username)
 
         selection = build_individual_enrollment_selection(
             [],
@@ -1366,9 +1386,9 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
                 }
             },
         })
-        existing = create_individual(self.user.username)
-        create_individual(self.user.username)
-        create_individual(self.user.username)
+        existing = create_verified_individual(self.user.username)
+        create_verified_individual(self.user.username)
+        create_verified_individual(self.user.username)
         beneficiary = Beneficiary(
             individual=existing,
             benefit_plan=benefit_plan,
@@ -1590,7 +1610,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
             GroupIndividual.objects.filter(group=group).update(
                 role=GroupIndividual.Role.SON
             )
-            head = create_individual(self.user.username, {
+            head = create_verified_individual(self.user.username, {
                 "dob": date(date.today().year - head_age, 1, 1),
                 "json_ext": {"gender": head_gender},
             })
@@ -1716,7 +1736,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         })
 
         def applicant(city):
-            return create_individual(self.user.username, {
+            return create_verified_individual(self.user.username, {
                 "json_ext": {"quota_scope": "city-quotas", "city": city},
             })
 
@@ -1792,10 +1812,10 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
                 "value": "assignment-individuals",
             }]}},
         })
-        active = create_individual(
+        active = create_verified_individual(
             self.user.username, {"json_ext": {"test_scope": "assignment-individuals"}}
         )
-        other_status = create_individual(
+        other_status = create_verified_individual(
             self.user.username, {"json_ext": {"test_scope": "assignment-individuals"}}
         )
 
@@ -1825,7 +1845,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         benefit_plan = self._benefit_plan("INDIVIDUAL")
         benefit_plan.max_beneficiaries = None
         benefit_plan.save(username=self.user.username)
-        create_individual(self.user.username, {"json_ext": {"validation_status": "VERIFIED"}})
+        create_verified_individual(self.user.username, {"json_ext": {"validation_status": "VERIFIED"}})
 
         selection = build_individual_enrollment_selection(
             [], str(benefit_plan.id), "ACTIVE", self.user
@@ -1840,7 +1860,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         benefit_plan.max_beneficiaries = 1
         benefit_plan.save(username=self.user.username)
         for _ in range(3):
-            create_individual(self.user.username, {"json_ext": {"validation_status": "VERIFIED"}})
+            create_verified_individual(self.user.username, {"json_ext": {"validation_status": "VERIFIED"}})
         selection = build_individual_enrollment_selection(
             [], str(benefit_plan.id), "ACTIVE", self.user,
         )

@@ -1,8 +1,23 @@
 import copy
 
+from individual.tests.test_helpers import create_individual
 from social_protection.tests.test_helpers import create_benefit_plan
 
 from enrolment.apps import EnrolmentConfig
+
+
+def create_verified_individual(username, payload_override=None):
+    """Create an individual the registry marks VERIFIED, as enrolment requires.
+
+    A ``validation_status`` given in ``payload_override["json_ext"]`` is kept, so
+    tests can still create PENDING or other unverified individuals.
+    """
+    data = copy.deepcopy(payload_override or {})
+    data["json_ext"] = {
+        "validation_status": "VERIFIED",
+        **(data.get("json_ext") or {}),
+    }
+    return create_individual(username, data)
 
 
 class ProfileRankingMixin:
