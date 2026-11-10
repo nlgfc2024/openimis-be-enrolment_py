@@ -17,6 +17,9 @@ The module accepts the following `MODULE_CONFIGURATION` keys:
   and the built-in eligibility rules (defaults `gender`, `primary_worker`,
   `validation_status` and `VERIFIED`).
 - `bulk_enrollment_batch_size`: persistence batch size.
+- `district_location_type`: the location type that counts as a district
+  (default `R`). Derived district values report the name of the nearest
+  location of this type, and the household district filter selects it.
 - `max_enrolment_score`: highest score a weighted ranking may award (default
   `100`). A ranking is rejected if its components' maximum points add up to
   more than this, or if its `weighted_score.normalise_to` is above it.
@@ -144,6 +147,36 @@ Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
 against current registry and beneficiary data in the same transaction.
 
+## Weighted scores
+
+`weighted_score.components` lists the score items. Each item reads one value,
+turns it into points with `scoring` (`mapping` or `numeric_bands`), and is
+weighted into the total. An item may set:
+
+- `field` (a `json_ext` key) or `derived`, but not both:
+  - `derived: age`: whole years on the enrolment date. Score it with
+    `numeric_bands` whose `min` and `max` are whole years. It needs a person,
+    so on GROUP Phases set `subject` (or `score_source`).
+  - `derived: district`: the name of the district the subject lives in (see
+    `district_location_type`). Score it with a `mapping` of district names.
+- `subject`, whose value the item reads: `self` on INDIVIDUAL Phases;
+  `household`, `head`, `primary_worker` or `any_member` on GROUP Phases.
+  Without it, the item reads the ranking's `score_source` (the primary worker)
+  when one is set, and otherwise the candidate itself.
+- `aggregate: max`, required with `any_member`: every member is scored and the
+  household gets its best member's points, or the item's `default` if it has
+  no members.
+- `label`: a name for the item, used in messages.
+
+```json
+{"label": "Labour capacity", "subject": "any_member", "aggregate": "max", "derived": "age", "weight": 4,
+ "scoring": {"type": "numeric_bands", "bands": [{"min": 18, "max": 45, "points": 4}, {"min": 46, "max": 55, "points": 3}]}}
+```
+
+Bands are checked in order and the first that matches gives the points, so
+"N or more" scales can be written as descending lower bounds. An item read from
+two different subjects counts as two items.
+
 ## Selection quotas
 
 A profile ranking's `selection_strategy` reserves places in the ranked
@@ -182,7 +215,8 @@ For other quotas, replace the female/youth keys with an ordered `quotas` list:
   to at most 100.
 - `when` conditions all apply to the `source` person. A condition is either a
   `json_ext` `field` with `filter`, `type` (`string`, `integer`, `numeric` or
-  `boolean`) and `value`, or `derived: age` with an integer `filter` and
+  `boolean`) and `value`, `derived: age` with an integer `filter` and `value`,
+  or `derived: district` with a string `filter` and a district name as
   `value`. An optional `subject` must name the source (`self`,
   `primary_worker` or `head`).
 - Buckets fill in order from the ranked list, and nobody takes more than one
