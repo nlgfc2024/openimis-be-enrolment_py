@@ -565,8 +565,7 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             self.assertEqual(profile_ranking_spec(plan, "ACTIVE")["order_by"], ["-id"])
             self.assertEqual(profile_ranking_spec(plan, "POTENTIAL")["order_by"], ["id"])
 
-    @patch("enrolment.ranking.build_order_by", side_effect=lambda queryset, order: queryset)
-    def test_phase_ranking_is_ignored_and_logged(self, build_order):
+    def test_a_phase_still_holding_a_ranking_cannot_enrol(self):
         queryset = MagicMock(model=Individual)
         queryset.count.return_value = 3
         plan = Mock(
@@ -574,16 +573,21 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
             json_ext={"enrolment_ranking": {"ACTIVE": {"order_by": ["-id"]}}},
             max_beneficiaries=1,
         )
-        with patch.object(EnrolmentConfig, "programme_profiles", {}), \
-                self.assertLogs("enrolment.ranking", "WARNING") as logs:
+        with patch.object(EnrolmentConfig, "programme_profiles", {}):
+            with self.assertRaisesMessage(
+                ValidationError, "Phase PWP-1 still has an enrolment_ranking",
+            ):
+                rank_and_cap_queryset(
+                    queryset, plan, "ACTIVE", 0, materialize_selected_ids=False,
+                )
+            queryset.count.assert_not_called()
+
+            # The empty ranking the Phase form sends to clear it does not block.
+            plan.json_ext = {"enrolment_ranking": {}}
             _, metadata = rank_and_cap_queryset(
                 queryset, plan, "ACTIVE", 0, materialize_selected_ids=False,
             )
-
-        self.assertIsNone(metadata["ranking"])
         self.assertEqual(metadata["will_enrol"], 3)
-        build_order.assert_not_called()
-        self.assertIn("Phase PWP-1 still has an enrolment_ranking", logs.output[0])
 
     def test_string_and_object_ordering_compile_as_annotated_distinct_sql(self):
         order_items, _, _ = validate_ranking_spec({
