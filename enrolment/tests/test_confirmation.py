@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from django.core.exceptions import ValidationError
 from unittest.mock import patch
 
@@ -419,6 +421,62 @@ class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
         task.refresh_from_db()
         self.assertEqual(task.status, Task.Status.FAILED)
         self.assertFalse(
+            Beneficiary.objects.filter(
+                individual=individual, benefit_plan=plan, is_deleted=False
+            ).exists()
+        )
+
+    @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
+    @patch(
+        "enrolment.confirmation.BeneficiaryImportService."
+        "synchronize_data_for_reporting"
+    )
+    def test_approval_checks_ages_on_the_day_of_submission(self, _synchronize):
+        token = "age-at-submission"
+        plan = self._plan("INDIVIDUAL", token)
+        EnrolmentConfig.programme_profiles = {plan.code: {"eligibility": {"criteria": [
+            {"derived": "age", "filter": "lte", "value": 60},
+        ]}}}
+        today = date.today()
+        birthday = today + timedelta(days=5)
+        try:
+            dob = birthday.replace(year=birthday.year - 61)
+        except ValueError:
+            dob = birthday.replace(year=birthday.year - 61, day=28)
+        # 60 when submitted, 61 by the time the enrolment is approved.
+        individual = create_verified_individual(
+            self.admin_user.username,
+            {"dob": dob, "json_ext": {"enrolment_test": token}},
+        )
+        EnrolmentService(self.admin_user).select_individuals_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+
+        class TenDaysLater(date):
+            @classmethod
+            def today(cls):
+                return today + timedelta(days=10)
+
+        with patch("enrolment.ranking.date", TenDaysLater):
+            # A new submission on the approval day would leave them out ...
+            later = build_individual_enrolment_selection(
+                [], str(plan.id), "ACTIVE", self.admin_user
+            )
+            self.assertFalse(
+                later["individual_query_with_filters"].filter(id=individual.id).exists()
+            )
+            # ... but approval keeps them, as they qualified when submitted.
+            TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertTrue(
             Beneficiary.objects.filter(
                 individual=individual, benefit_plan=plan, is_deleted=False
             ).exists()

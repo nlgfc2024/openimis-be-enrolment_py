@@ -106,8 +106,8 @@ Phases' codes instead.
   - Criteria with the same member subject must all be met by one member. For
     example, two `any_member` criteria need a single member who meets both.
   - In place of `field`, a criterion may set `derived`, with the same rules as
-    in quota conditions: `age` (whole years on the enrolment date, an integer
-    `filter` and `value`) or `district` (the name of the district the subject
+    in quota conditions: `age` (whole years on the day the enrolment is
+    submitted, an integer `filter` and `value`) or `district` (the name of the district the subject
     lives in, a string `filter` and `value`). Age needs a person, so on GROUP
     Phases set `subject` to `head`, `primary_worker` or `any_member`. For
     example, UPG's working-age limit:
@@ -159,7 +159,9 @@ the Phase's profile and clear it from the Phase.
 
 Confirmation locks the benefit plan before the final eligibility, ranking,
 capacity, and persistence steps. Maker-checker approval repeats those checks
-against current registry and beneficiary data in the same transaction.
+against current registry and beneficiary data in the same transaction. Ages
+are still worked out on the day the enrolment was submitted, so a candidate
+who met an age rule then is not refused because approval came later.
 
 ## Weighted scores
 
@@ -168,7 +170,7 @@ turns it into points with `scoring` (`mapping` or `numeric_bands`), and is
 weighted into the total. An item may set:
 
 - `field` (a `json_ext` key) or `derived`, but not both:
-  - `derived: age`: whole years on the enrolment date. Score it with
+  - `derived: age`: whole years on the day the enrolment is submitted. Score it with
     `numeric_bands` whose `min` and `max` are whole years. It needs a person,
     so on GROUP Phases set `subject` (or `score_source`).
   - `derived: district`: the name of the district the subject lives in (see
