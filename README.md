@@ -118,9 +118,9 @@ Phases' codes instead.
     ```
 - `ranking` holds entries keyed by beneficiary status, or `*` for any status.
   Each entry sets `order_by`, `tie_breaker`, `limit`, `score_source`,
-  `weighted_score` and `selection_strategy` (see the sections below). It is the
-  only place rankings are set; the enrolment summary shows the one that
-  applied.
+  `weighted_score`, `minimum_score` and `selection_strategy` (see the sections
+  below). It is the only place rankings are set; the enrolment summary shows the
+  one that applied.
 - Profile rankings are checked when the configuration is saved, without a
   Phase's `beneficiary_data_schema`. Name beneficiary data as `json_ext__<key>`
   or through a member `subject`; enrolment checks the ranking again against the
@@ -192,6 +192,13 @@ weighted into the total. An item may set:
 Bands are checked in order and the first that matches gives the points, so
 "N or more" scales can be written as descending lower bounds. An item read from
 two different subjects counts as two items.
+
+`minimum_score`, next to `weighted_score` in a ranking entry, leaves out
+candidates whose total score is below it. They are cut before the cap,
+`limit.percentage` and selection quotas apply, so none of them can take a
+place, even a reserved one. It must be a positive number no higher than
+`normalise_to`. The enrolment summary reports how many were cut as
+`belowMinimumScore`, and `poolSize` counts only those who reach the minimum.
 
 ## Selection quotas
 
