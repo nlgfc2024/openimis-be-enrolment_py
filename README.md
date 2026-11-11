@@ -18,8 +18,11 @@ The module accepts the following `MODULE_CONFIGURATION` keys:
   `validation_status` and `VERIFIED`).
 - `bulk_enrollment_batch_size`: persistence batch size.
 - `district_location_type`: the location type that counts as a district
-  (default `R`). Derived district values report the name of the nearest
-  location of this type, and the household district filter selects it.
+  (default `R`), one of the location module's `location_types`. Derived
+  district values report the name of the nearest location of this type, and
+  the household district filter selects it. District names in score mappings
+  and in `exact` or `iexact` conditions must name an active location of this
+  type. Both are checked when the configuration is saved.
 - `max_enrolment_score`: highest score a weighted ranking may award (default
   `100`). A ranking is rejected if its components' maximum points add up to
   more than this, or if its `weighted_score.normalise_to` is above it.

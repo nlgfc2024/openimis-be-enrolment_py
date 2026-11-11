@@ -71,6 +71,74 @@ def validate_programme_profiles(profiles):
     return errors
 
 
+# Filters whose value is a whole district name, and whether case matters.
+DISTRICT_NAME_FILTERS = {"exact": True, "iexact": False}
+
+
+def district_name_errors(profiles, district_type):
+    """Return errors for district names in valid profiles that name no district.
+
+    Checks score mappings of derived districts and criteria and quota conditions
+    that compare a derived district with ``exact`` or ``iexact``; other filters
+    take parts of names. A district counts when it is an active location of
+    ``district_type``.
+    """
+    from location.models import Location
+
+    used = [
+        (path, name, case_sensitive)
+        for code, profile in profiles.items()
+        for path, name, case_sensitive in _district_names(profile, f"programme_profiles.{code}")
+    ]
+    if not used:
+        return []
+    names = set(Location.objects.filter(
+        type=district_type, *Location.filter_validity()
+    ).values_list("name", flat=True))
+    folded = {name.upper() for name in names}
+    return [
+        f"{path} {name} is not the name of an active district ({district_type})."
+        for path, name, case_sensitive in used
+        if (name not in names if case_sensitive else name.upper() not in folded)
+    ]
+
+
+def _district_names(profile, path):
+    """Yield ``(path, name, case_sensitive)`` for each district name a profile uses."""
+    criteria = (profile.get("eligibility") or {}).get("criteria") or []
+    for index, criterion in enumerate(criteria):
+        if criterion.get("derived") == "district" and criterion["filter"] in DISTRICT_NAME_FILTERS:
+            yield (
+                f"{path}.eligibility.criteria[{index}].value",
+                criterion["value"],
+                DISTRICT_NAME_FILTERS[criterion["filter"]],
+            )
+    for status, entry in (profile.get("ranking") or {}).items():
+        ranking_path = f"{path}.ranking.{status}"
+        components = (entry.get("weighted_score") or {}).get("components") or []
+        for index, component in enumerate(components):
+            if component.get("derived") == "district":
+                for name in component["scoring"]["values"]:
+                    yield (
+                        f"{ranking_path}.weighted_score.components[{index}].scoring.values",
+                        name,
+                        True,
+                    )
+        quotas = (entry.get("selection_strategy") or {}).get("quotas") or []
+        for index, quota in enumerate(quotas):
+            for condition_index, condition in enumerate(quota["when"]):
+                if (
+                    condition.get("derived") == "district"
+                    and condition["filter"] in DISTRICT_NAME_FILTERS
+                ):
+                    yield (
+                        f"{ranking_path}.selection_strategy.quotas[{index}]"
+                        f".when[{condition_index}].value",
+                        condition["value"],
+                        DISTRICT_NAME_FILTERS[condition["filter"]],
+                    )
+
+
 def _unsuitable_profile_errors(profile, path):
     """Report a profile that no Phase type can use, with each type's reasons."""
     reasons = {
