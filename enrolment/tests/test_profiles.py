@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from django.apps import apps
 from django.core.exceptions import ValidationError
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from individual.models import Group, Individual
 from individual.tests.test_helpers import (
@@ -240,6 +240,69 @@ class ModuleConfigValueTest(SimpleTestCase):
             with self.subTest(name):
                 with self.assertRaises(ValidationError):
                     EnrolmentConfig._validate_config(self._profile_config(profile))
+
+    def test_district_location_type_must_be_a_location_type_on_save(self):
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["district_location_type"] = "r"
+        with self.assertRaisesMessage(
+            ValidationError, "district_location_type r is not a location type"
+        ):
+            EnrolmentConfig._validate_config(config)
+        # A stored value is not checked at startup, when location types may
+        # not be loaded yet.
+        EnrolmentConfig._validate_config(config, on_load=True)
+
+
+class DistrictNameValidationTest(TestCase):
+    def setUp(self):
+        create_village_in("DN-Zomba")
+
+    def _validate(self, profile, on_load=False):
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["programme_profiles"] = {"default": profile}
+        EnrolmentConfig._validate_config(config, on_load=on_load)
+
+    def _criteria(self, *criteria):
+        return {"eligibility": {"criteria": list(criteria)}}
+
+    def test_names_of_active_districts_are_accepted(self):
+        self._validate(self._criteria(
+            _district("DN-Zomba"),
+            _district("dn-zomba", filter="iexact"),
+            # Other filters compare parts of names, which are not checked.
+            _district("Zomb", filter="icontains"),
+        ))
+
+    def test_unknown_district_names_are_rejected_on_save(self):
+        district = {"derived": "district", "filter": "exact", "value": "DN-Zomb"}
+        cases = {
+            "programme_profiles.default.eligibility.criteria[0].value DN-Zomb":
+                self._criteria(_district("DN-Zomb")),
+            "programme_profiles.default.eligibility.criteria[0].value dn-zomba":
+                self._criteria(_district("dn-zomba")),
+            "programme_profiles.default.ranking.*.weighted_score.components[0]"
+            ".scoring.values DN-Zomb":
+                {"ranking": {"*": {
+                    "order_by": [{"field": "_weighted_score", "direction": "desc"}],
+                    "weighted_score": {"components": [{
+                        "derived": "district", "weight": 3,
+                        "scoring": {"type": "mapping", "values": {"DN-Zomba": 3, "DN-Zomb": 1}},
+                    }]},
+                }}},
+            "programme_profiles.default.ranking.*.selection_strategy.quotas[0]"
+            ".when[0].value DN-Zomb":
+                {"ranking": {"*": {"selection_strategy": {"source": "SELF", "quotas": [
+                    {"key": "zomba", "count": 1, "when": [district]},
+                ]}}}},
+        }
+        for message, profile in cases.items():
+            with self.subTest(message):
+                with self.assertRaisesMessage(
+                    ValidationError,
+                    f"{message} is not the name of an active district (R).",
+                ):
+                    self._validate(profile)
+                self._validate(profile, on_load=True)
 
 
 class ProgrammeProfileResolutionTest(SimpleTestCase):

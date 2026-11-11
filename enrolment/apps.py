@@ -90,9 +90,12 @@ class EnrolmentConfig(AppConfig):
         """Raise ValidationError for an invalid configuration.
 
         ``on_load`` is for a configuration that is already stored: retired
-        mandatory criteria are then left to the warning ``_load_config`` logs.
+        mandatory criteria are then left to the warning ``_load_config`` logs,
+        and values checked against other modules' data (location types and
+        district names) are only checked on save, since that data may not be
+        loaded yet at startup.
         """
-        from enrolment.profiles import validate_programme_profiles
+        from enrolment.profiles import district_name_errors, validate_programme_profiles
 
         errors = []
         if not on_load and _holds_mandatory_criteria(config):
@@ -128,9 +131,19 @@ class EnrolmentConfig(AppConfig):
             or max_score <= 0
         ):
             errors.append("max_enrolment_score must be a positive number.")
-        errors.extend(validate_programme_profiles(
-            config.get("programme_profiles", DEFAULT_CONFIG["programme_profiles"])
-        ))
+        district_type = config.get("district_location_type")
+        if not on_load and isinstance(district_type, str) and district_type.strip():
+            from location.apps import LocationConfig
+
+            if district_type not in LocationConfig.location_types:
+                errors.append(
+                    f"district_location_type {district_type} is not a location type; "
+                    "location types: " + ", ".join(LocationConfig.location_types) + "."
+                )
+        profiles = config.get("programme_profiles", DEFAULT_CONFIG["programme_profiles"])
+        errors.extend(validate_programme_profiles(profiles))
+        if not on_load and not errors:
+            errors.extend(district_name_errors(profiles, district_type))
         if errors:
             raise ValidationError({"config": errors})
 
