@@ -196,9 +196,22 @@ two different subjects counts as two items.
 `minimum_score`, next to `weighted_score` in a ranking entry, leaves out
 candidates whose total score is below it. They are cut before the cap,
 `limit.percentage` and selection quotas apply, so none of them can take a
-place, even a reserved one. It must be a positive number no higher than
-`normalise_to`. The enrolment summary reports how many were cut as
+place, even a reserved one. The enrolment summary reports how many were cut as
 `belowMinimumScore`, and `poolSize` counts only those who reach the minimum.
+
+`minimum_score` applies only to the weighted total (`_weighted_score`), so it
+needs `weighted_score` and must be a positive number no higher than
+`normalise_to`, the highest total anyone can reach. It does not limit any
+single value. For a threshold on one value, such as a PMT score, add an
+eligibility criterion to the profile instead:
+
+```json
+{"subject": "head", "field": "household_pmt_score", "filter": "lte", "type": "numeric", "value": 35}
+```
+
+The two can be combined: a value can have its own criterion, add points to the
+weighted score through a `numeric_bands` item, and sort candidates in
+`order_by`, while `minimum_score` still applies to the total.
 
 ## Selection quotas
 
