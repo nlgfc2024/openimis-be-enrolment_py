@@ -1,4 +1,5 @@
 import copy
+from datetime import date
 from unittest.mock import Mock, patch
 
 from django.apps import apps
@@ -24,6 +25,15 @@ from enrolment.profiles import (
     validate_programme_profiles,
 )
 from enrolment.services import EnrolmentService, build_group_enrolment_selection
+from enrolment.tests.helpers import create_village_in
+
+
+def _age(filter_name, value, **overrides):
+    return {"derived": "age", "filter": filter_name, "value": value, **overrides}
+
+
+def _district(name, **overrides):
+    return {"derived": "district", "filter": "exact", "value": name, **overrides}
 
 
 def _criterion(**overrides):
@@ -79,7 +89,14 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
             (_criterion(filter="gte"), "filter gte is not allowed for string"),
             (_criterion(type="integer", filter="gte", value="5"), "value must be of type integer"),
             (_criterion(type="numeric", filter="gte", value=float("inf")), "value must be of type numeric"),
-            (_criterion(derived="age"), "Unsupported"),
+            (_criterion(derived="age"), "must set exactly one of field or derived"),
+            ({"filter": "exact", "type": "string", "value": "x"}, "must set exactly one of field or derived"),
+            (_age("gte", 18, derived="income"), "supported values: age, district"),
+            (_age("gte", "18"), "value must be an age from 0 to 120"),
+            (_age("gte", 18, type="string"), "type must be integer for age"),
+            (_age("icontains", 18), "filter icontains is not allowed for age"),
+            (_district(""), "value must be a district name"),
+            (_district("Zomba", filter="gte"), "filter gte is not allowed for district"),
         ]
         for criterion, message in cases:
             with self.subTest(message=message):
@@ -103,6 +120,27 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
         self.assertEqual(errors, [
             "programme_profiles.MIXED suits neither Phase type. "
             "GROUP Phases: eligibility.criteria[1] uses subject self. "
+            "INDIVIDUAL Phases: eligibility.criteria[0] uses subject household."
+        ])
+
+    def test_derived_criteria_suit_the_phase_types_that_have_the_value(self):
+        self.assertEqual(validate_programme_profiles({
+            "UPG": {"eligibility": {"criteria": [
+                _age("gte", 18, subject="primary_worker"),
+                _age("lte", 60, subject="primary_worker"),
+                _district("Zomba", subject="household"),
+            ]}},
+            # Without a subject, age reads the candidate: INDIVIDUAL Phases only.
+            "UMEP": {"eligibility": {"criteria": [_age("gte", 18), _district("Zomba")]}},
+        }), [])
+
+        errors = validate_programme_profiles({"UPG": {"eligibility": {"criteria": [
+            _age("gte", 18, subject="household"),
+        ]}}})
+        self.assertEqual(errors, [
+            "programme_profiles.UPG suits neither Phase type. "
+            "GROUP Phases: eligibility.criteria[0].derived age needs a person: set "
+            "subject to head, primary_worker or any_member. "
             "INDIVIDUAL Phases: eligibility.criteria[0] uses subject household."
         ])
 
@@ -293,6 +331,14 @@ class ProgrammeProfileEligibilityTest(SimpleTestCase):
                 [_criterion(subject="primary_worker")], Individual, "INDIVIDUAL"
             )
 
+    def test_age_without_a_subject_cannot_be_used_by_group_phases(self):
+        with self.assertRaisesMessage(
+            ValidationError,
+            "Programme profile default cannot be used by GROUP Phases: "
+            "eligibility.criteria[0].derived age needs a person",
+        ):
+            self._apply([_age("gte", 18)], Group, "GROUP")
+
 
 class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
     """Profiles applied to real registry records, through preview and approval."""
@@ -328,20 +374,27 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
             profile["ranking"] = {"*": ranking}
         EnrolmentConfig.programme_profiles = {plan.code: profile}
 
-    def _household(self, token, members, primary_worker=0):
-        """Create a VERIFIED household from members' json_ext; the first is head."""
+    def _household(self, token, members, primary_worker=0, people=None, **group_fields):
+        """Create a VERIFIED household from members' json_ext; the first is head.
+
+        ``people`` gives each member's other Individual fields, such as ``dob``.
+        """
         username = self.admin_user.username
-        group = create_group(username, {"json_ext": {"enrolment_test": token}})
+        group = create_group(username, {
+            "json_ext": {"enrolment_test": token}, **group_fields,
+        })
+        people = people or [{} for _ in members]
         memberships = [
             add_individual_to_group(
                 username,
                 create_individual(username, {
                     "json_ext": {"enrolment_test": token, **json_ext},
+                    **person,
                 }),
                 group,
                 is_head=index == 0,
             )
-            for index, json_ext in enumerate(members)
+            for index, (json_ext, person) in enumerate(zip(members, people))
         ]
         memberships[primary_worker].json_ext = {"primary_worker": True}
         memberships[primary_worker].save(username=username)
@@ -413,6 +466,35 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
         ])
 
         self.assertEqual(self._eligible(plan), {one_member.id})
+
+    def test_upg_age_limit_reads_the_primary_worker(self):
+        token = "profile-age"
+        plan = self._plan(token, [
+            _age("gte", 18, subject="primary_worker"),
+            _age("lte", 60, subject="primary_worker"),
+        ])
+        this_year = date.today().year
+
+        def household(primary_worker_age):
+            # The head is 40 in both, so only the primary worker's age differs.
+            return self._household(
+                token, [{}, {}], primary_worker=1,
+                people=[{"dob": date(this_year - 40, 1, 1)},
+                        {"dob": date(this_year - primary_worker_age, 1, 1)}],
+            )
+
+        working_age = household(30)
+        household(65)
+
+        self.assertEqual(self._eligible(plan), {working_age.id})
+
+    def test_district_criterion_reads_where_the_household_lives(self):
+        token = "profile-district"
+        plan = self._plan(token, [_district("PD-Zomba", subject="household")])
+        in_zomba = self._household(token, [{}], location=create_village_in("PD-Zomba"))
+        self._household(token, [{}], location=create_village_in("PD-Dedza"))
+
+        self.assertEqual(self._eligible(plan), {in_zomba.id})
 
     def _households_by_head_pmt(self, token):
         richer = self._household(token, [{"household_pmt_score": 30}])
