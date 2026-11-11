@@ -102,6 +102,17 @@ Phases' codes instead.
     `any_member`.
   - Criteria with the same member subject must all be met by one member. For
     example, two `any_member` criteria need a single member who meets both.
+  - In place of `field`, a criterion may set `derived`, with the same rules as
+    in quota conditions: `age` (whole years on the enrolment date, an integer
+    `filter` and `value`) or `district` (the name of the district the subject
+    lives in, a string `filter` and `value`). Age needs a person, so on GROUP
+    Phases set `subject` to `head`, `primary_worker` or `any_member`. For
+    example, UPG's working-age limit:
+
+    ```json
+    {"subject": "primary_worker", "derived": "age", "filter": "gte", "value": 18},
+    {"subject": "primary_worker", "derived": "age", "filter": "lte", "value": 60}
+    ```
 - `ranking` holds entries keyed by beneficiary status, or `*` for any status.
   Each entry sets `order_by`, `tie_breaker`, `limit`, `score_source`,
   `weighted_score` and `selection_strategy` (see the sections below). It is the
