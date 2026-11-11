@@ -1,5 +1,7 @@
 import json
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, timedelta
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
@@ -915,7 +917,7 @@ def _points_case(value_alias, component):
         cases = []
         for band in scoring["bands"]:
             if component.get("derived") == "age":
-                # Ages compare as date-of-birth ranges on the enrolment date.
+                # Ages compare as date-of-birth ranges (see age_reference_date).
                 condition = Q()
                 if "min" in band:
                     condition &= _age_condition_q(value_alias, "gte", band["min"])
@@ -993,6 +995,28 @@ def build_weighted_score(queryset, weighted_score, score_source=None):
     )
 
 
+_AGE_REFERENCE_DATE = ContextVar("enrolment_age_reference_date", default=None)
+
+
+@contextmanager
+def ages_on(day):
+    """Work out derived ages on ``day`` instead of today within the block.
+
+    Approval re-checks an enrolment against the day it was submitted, so a
+    delay before approval does not change who qualifies or ranks by age.
+    """
+    token = _AGE_REFERENCE_DATE.set(day)
+    try:
+        yield
+    finally:
+        _AGE_REFERENCE_DATE.reset(token)
+
+
+def age_reference_date():
+    """Return the day derived ages are worked out on (see ``ages_on``)."""
+    return _AGE_REFERENCE_DATE.get() or date.today()
+
+
 def _years_ago_boundary(today, years):
     try:
         return today.replace(year=today.year - years)
@@ -1033,7 +1057,7 @@ def _annotate_selection_source(queryset, source):
 
 def _age_condition_q(dob_field, filter_name, age):
     """Translate an age comparison into a date-of-birth range on ``dob_field``."""
-    today = date.today()
+    today = age_reference_date()
     if filter_name == "gt":
         filter_name, age = "gte", age + 1
     elif filter_name == "lt":

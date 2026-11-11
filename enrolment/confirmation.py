@@ -3,6 +3,7 @@ import logging
 from core.models import User
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.utils import timezone
 
 from individual.models import Individual, IndividualDataSource
 from social_protection.models import (
@@ -22,6 +23,7 @@ from enrolment.persistence import (
     EnrollmentPersistenceService,
     calculate_percentage_of_invalid_items,
 )
+from enrolment.ranking import ages_on
 
 
 logger = logging.getLogger(__name__)
@@ -313,6 +315,18 @@ def _complete_group_approval(user, benefit_plan, upload_id, status, custom_filte
     )
 
 
+def _submission_date(upload_record):
+    """Return the day an enrolment was submitted for approval.
+
+    The staged upload record is created in the same transaction as the
+    submission, including for tasks submitted before this was recorded.
+    """
+    submitted = upload_record.date_created
+    if timezone.is_aware(submitted):
+        submitted = timezone.localtime(submitted)
+    return submitted.date()
+
+
 @transaction.atomic
 def on_task_complete_enrolment(**kwargs):
     """Complete an approved enrollment task inside the Enrolment module."""
@@ -345,8 +359,9 @@ def on_task_complete_enrolment(**kwargs):
 
         # The nested atomic block creates a savepoint. Catching below can mark
         # the workflow failed without committing beneficiaries written before a
-        # later reporting or persistence error.
-        with transaction.atomic():
+        # later reporting or persistence error. Ages are re-checked on the day
+        # of submission, so an approval delay cannot age a candidate out.
+        with transaction.atomic(), ages_on(_submission_date(upload_record)):
             benefit_plan = BenefitPlan.objects.select_for_update().get(
                 id=task_data["benefit_plan_id"]
             )
