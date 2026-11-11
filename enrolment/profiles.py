@@ -14,7 +14,12 @@ from django.db.models import Exists, OuterRef
 from core.custom_filters import CustomFilterWizardStorage
 
 from enrolment.apps import EnrolmentConfig
-from enrolment.criteria import FILTERS_BY_TYPE, VALUE_TYPES, criterion_to_condition
+from enrolment.criteria import (
+    FILTERS_BY_TYPE,
+    VALUE_TYPES,
+    criterion_to_condition,
+    is_one_of,
+)
 from enrolment.membership import CANDIDATE_SUBJECTS, HOUSEHOLD_SUBJECT, MEMBER_SUBJECTS
 from enrolment.ranking import (
     derived_condition_q,
@@ -101,7 +106,7 @@ def phase_type_errors(profile, phase_type):
     criteria = (profile.get("eligibility") or {}).get("criteria") or []
     for index, criterion in enumerate(criteria):
         subject = criterion.get("subject")
-        if subject is not None and subject not in subjects:
+        if subject is not None and not is_one_of(subject, subjects):
             errors.append(f"eligibility.criteria[{index}] uses subject {subject}")
         elif (
             criterion.get("derived") == "age"
@@ -139,7 +144,7 @@ def _criterion_errors(criterion, path):
     if unexpected:
         return [f"Unsupported {path} keys: " + ", ".join(sorted(unexpected))]
     subject = criterion.get("subject")
-    if subject is not None and subject not in SUBJECTS:
+    if subject is not None and not is_one_of(subject, SUBJECTS):
         return [f"{path}.subject must be one of " + ", ".join(sorted(SUBJECTS)) + "."]
     if ("field" in criterion) == ("derived" in criterion):
         return [f"{path} must set exactly one of field or derived."]
@@ -158,10 +163,10 @@ def _criterion_errors(criterion, path):
     ):
         return [f"{path}.field must be a json_ext key."]
     value_type = criterion.get("type")
-    if value_type not in VALUE_TYPES:
+    if not is_one_of(value_type, VALUE_TYPES):
         return [f"{path}.type must be one of " + ", ".join(sorted(VALUE_TYPES)) + "."]
     filter_name = criterion.get("filter")
-    if filter_name not in FILTERS_BY_TYPE[value_type]:
+    if not is_one_of(filter_name, FILTERS_BY_TYPE[value_type]):
         return [f"{path}.filter {filter_name} is not allowed for {value_type}."]
     if not VALUE_TYPES[value_type](criterion.get("value")):
         return [f"{path}.value must be of type {value_type}."]
