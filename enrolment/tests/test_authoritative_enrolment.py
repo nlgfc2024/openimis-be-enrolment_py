@@ -29,14 +29,17 @@ from enrolment.ranking import (
 )
 from individual.models import Group, GroupIndividual, Individual
 from enrolment.schema import Query
-from enrolment.tests.helpers import ProfileRankingMixin, create_verified_individual
+from enrolment.tests.helpers import (
+    ProfileRankingMixin,
+    create_verified_individual,
+    create_village_in,
+)
 from individual.custom_filters import GroupCustomFilterWizard, IndividualCustomFilterWizard
 from individual.tests.test_helpers import (
     add_individual_to_group,
     create_group,
     create_individual,
 )
-from location.models import Location
 from social_protection.tests.test_helpers import create_benefit_plan
 from social_protection.models import Beneficiary, GroupBeneficiary
 
@@ -1862,17 +1865,6 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         )
         self.assertEqual(selection["pool_size"], 5)
 
-    def _village_in(self, district_name):
-        """Create a district and a village three levels below it."""
-        def location(kind, parent=None):
-            # Only the district level carries the district's name.
-            name = district_name if kind == "R" else f"{district_name} {kind}"
-            return Location.objects.create(
-                type=kind, code=f"{district_name}-{kind}", name=name,
-                parent=parent, audit_user_id=-1,
-            )
-        return location("V", location("W", location("D", location("R"))))
-
     def test_age_score_reads_the_primary_worker_or_the_best_member(self):
         youth = {"type": "numeric_bands", "bands": [{"min": 18, "max": 35, "points": 10}]}
         today = date.today()
@@ -1910,10 +1902,10 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
 
     def test_district_score_reads_where_the_individual_lives(self):
         in_zomba = create_verified_individual(self.user.username, {
-            "location": self._village_in("DS-Zomba"),
+            "location": create_village_in("DS-Zomba"),
         })
         elsewhere = create_verified_individual(self.user.username, {
-            "location": self._village_in("DS-Dedza"),
+            "location": create_village_in("DS-Dedza"),
         })
 
         scores = dict(build_weighted_score(
@@ -1928,7 +1920,7 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         self.assertEqual(scores, {in_zomba.id: 3.0, elsewhere.id: 0.0})
 
     def test_district_quotas_place_individuals_by_their_location(self):
-        zomba, blantyre = self._village_in("DQ-Zomba"), self._village_in("DQ-Blantyre")
+        zomba, blantyre = create_village_in("DQ-Zomba"), create_village_in("DQ-Blantyre")
         benefit_plan = self._ranked_plan(self.user.username, payload_override={
             "type": "INDIVIDUAL",
             "max_beneficiaries": 2,

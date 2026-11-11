@@ -15,14 +15,18 @@ from core.custom_filters import CustomFilterWizardStorage
 
 from enrolment.apps import EnrolmentConfig
 from enrolment.criteria import FILTERS_BY_TYPE, VALUE_TYPES, criterion_to_condition
-from enrolment.membership import CANDIDATE_SUBJECTS, MEMBER_SUBJECTS
-from enrolment.ranking import ranking_errors
+from enrolment.membership import CANDIDATE_SUBJECTS, HOUSEHOLD_SUBJECT, MEMBER_SUBJECTS
+from enrolment.ranking import (
+    derived_condition_q,
+    normalise_derived_condition,
+    ranking_errors,
+)
 
 
 DEFAULT_PROFILE = "default"
 PROFILE_KEYS = {"description", "eligibility", "ranking"}
 ELIGIBILITY_KEYS = {"criteria"}
-CRITERION_KEYS = {"subject", "field", "filter", "type", "value"}
+CRITERION_KEYS = {"subject", "field", "derived", "filter", "type", "value"}
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
 PHASE_TYPES = tuple(CANDIDATE_SUBJECTS)
 
@@ -99,6 +103,14 @@ def phase_type_errors(profile, phase_type):
         subject = criterion.get("subject")
         if subject is not None and subject not in subjects:
             errors.append(f"eligibility.criteria[{index}] uses subject {subject}")
+        elif (
+            criterion.get("derived") == "age"
+            and (subject or CANDIDATE_SUBJECTS[phase_type]) == HOUSEHOLD_SUBJECT
+        ):
+            errors.append(
+                f"eligibility.criteria[{index}].derived age needs a person: set "
+                "subject to head, primary_worker or any_member"
+            )
     if "ranking" in profile:
         model = Group if phase_type == "GROUP" else Individual
         errors.extend(ranking_errors(profile["ranking"], model, path="ranking"))
@@ -129,6 +141,14 @@ def _criterion_errors(criterion, path):
     subject = criterion.get("subject")
     if subject is not None and subject not in SUBJECTS:
         return [f"{path}.subject must be one of " + ", ".join(sorted(SUBJECTS)) + "."]
+    if ("field" in criterion) == ("derived" in criterion):
+        return [f"{path} must set exactly one of field or derived."]
+    if "derived" in criterion:
+        try:
+            normalise_derived_condition(criterion, path)
+        except ValidationError as error:
+            return error.messages
+        return []
     field = criterion.get("field")
     if (
         not isinstance(field, str)
@@ -183,38 +203,45 @@ def apply_profile_eligibility(queryset, benefit_plan, phase_type):
             f"Programme profile {key} cannot be used by {phase_type} Phases: "
             + _sentence(errors)
         )
+    from individual.models import Individual
+
     eligibility = profile.get("eligibility") or {}
     candidate_subject = CANDIDATE_SUBJECTS[phase_type]
-    conditions_by_subject = {}
-    for criterion in eligibility.get("criteria") or []:
+    by_subject = {}
+    for index, criterion in enumerate(eligibility.get("criteria") or []):
         subject = criterion.get("subject", candidate_subject)
-        conditions_by_subject.setdefault(subject, []).append(
-            criterion_to_condition(criterion)
-        )
+        conditions, derived = by_subject.setdefault(subject, ([], []))
+        if "derived" in criterion:
+            derived.append(normalise_derived_condition(
+                criterion, f"eligibility.criteria[{index}]"
+            ))
+        else:
+            conditions.append(criterion_to_condition(criterion))
 
-    candidate_conditions = conditions_by_subject.pop(candidate_subject, [])
-    if candidate_conditions:
-        queryset = CustomFilterWizardStorage.build_custom_filters_queryset(
-            "individual",
-            "Group" if phase_type == "GROUP" else "Individual",
-            candidate_conditions,
-            queryset,
-        )
-    for subject, conditions in conditions_by_subject.items():
-        queryset = queryset.filter(_member_matches(subject, conditions))
+    candidate_conditions, candidate_derived = by_subject.pop(candidate_subject, ([], []))
+    queryset = _matching(queryset, candidate_conditions, candidate_derived)
+    for subject, (conditions, derived) in by_subject.items():
+        matching = _matching(Individual.objects.filter(is_deleted=False), conditions, derived)
+        queryset = queryset.filter(_member_matches(subject, matching))
     return queryset
 
 
-def _member_matches(subject, conditions):
-    """Require one household member of ``subject`` to meet every condition."""
-    from individual.models import Individual
+def _matching(queryset, conditions, derived):
+    """Restrict households or individuals to json_ext conditions and derived values."""
+    if conditions:
+        queryset = CustomFilterWizardStorage.build_custom_filters_queryset(
+            "individual",
+            queryset.model.__name__,
+            conditions,
+            queryset,
+        )
+    for condition in derived:
+        queryset = queryset.filter(derived_condition_q(condition, queryset.model))
+    return queryset
 
-    matching = CustomFilterWizardStorage.build_custom_filters_queryset(
-        "individual",
-        "Individual",
-        conditions,
-        Individual.objects.filter(is_deleted=False),
-    )
+
+def _member_matches(subject, matching):
+    """Require one household member of ``subject`` among ``matching`` individuals."""
     return Exists(
         MEMBER_SUBJECTS[subject]().filter(
             group_id=OuterRef("pk"),
