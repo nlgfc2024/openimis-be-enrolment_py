@@ -190,6 +190,58 @@ class ProgrammeProfileValidationTest(SimpleTestCase):
         EnrolmentConfig._validate_config(copy.deepcopy(DEFAULT_CONFIG))
 
 
+class ModuleConfigValueTest(SimpleTestCase):
+    def _profile_config(self, profile):
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["programme_profiles"] = {"default": profile}
+        return config
+
+    def test_a_list_or_object_in_place_of_a_name_is_a_validation_error(self):
+        mapping = {"type": "mapping", "values": {"a": 1}}
+
+        def component(**keys):
+            return {"ranking": {"*": {"weighted_score": {"components": [
+                {"field": "x", "weight": 1, "scoring": mapping, **keys}
+            ]}}}}
+
+        def quota(**keys):
+            return {"ranking": {"*": {"selection_strategy": {"source": "SELF", "quotas": [{
+                "key": "k", "count": 1,
+                "when": [{"derived": "age", "filter": "gte", "value": 1, **keys}],
+            }]}}}}
+
+        def order_by(**keys):
+            return {"ranking": {"*": {"order_by": [{"field": "json_ext__x", **keys}]}}}
+
+        def criterion(**keys):
+            return {"eligibility": {"criteria": [_criterion(**keys)]}}
+
+        cases = {
+            "component subject": component(subject=["head"]),
+            "component aggregate": component(subject="any_member", aggregate=["max"]),
+            "component derived": {"ranking": {"*": {"weighted_score": {"components": [
+                {"derived": [], "weight": 1, "scoring": mapping}
+            ]}}}},
+            "criterion subject": criterion(subject=["head"]),
+            "criterion filter": criterion(filter=["exact"]),
+            "criterion type": criterion(type={"string": True}),
+            "criterion derived": {"eligibility": {"criteria": [_age("gte", 1, derived=[])]}},
+            "quota source": {"ranking": {"*": {"selection_strategy": {
+                "source": ["SELF"], "female_percentage": 10,
+            }}}},
+            "quota filter": quota(filter=["gte"]),
+            "quota derived": quota(derived=[]),
+            "order_by subject": order_by(subject=["head"]),
+            "order_by direction": order_by(direction=["asc"]),
+            "order_by cast": order_by(cast=["float"]),
+            "order_by nulls": order_by(nulls=["last"]),
+        }
+        for name, profile in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValidationError):
+                    EnrolmentConfig._validate_config(self._profile_config(profile))
+
+
 class ProgrammeProfileResolutionTest(SimpleTestCase):
     profiles = {
         "RMEP": {"eligibility": {"criteria": [_criterion(value="RMEP")]}},

@@ -31,6 +31,18 @@ def is_number(value):
     )
 
 
+def is_one_of(value, choices):
+    """Return whether ``value`` is one of ``choices``.
+
+    Configuration values come from JSON, where a list or object in place of a
+    name would make a plain membership test raise TypeError.
+    """
+    try:
+        return value in choices
+    except TypeError:
+        return False
+
+
 # Value types a configured condition (a profile criterion or a quota condition)
 # may use: those the individual module's custom filter wizards can cast. Each
 # maps to a check on the configured value; FILTERS_BY_TYPE gives the filters.

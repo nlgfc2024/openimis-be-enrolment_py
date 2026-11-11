@@ -29,6 +29,7 @@ from enrolment.criteria import (
     VALUE_TYPES,
     criterion_to_condition,
     is_number,
+    is_one_of,
 )
 from enrolment.district import district_name, in_district
 from enrolment.membership import (
@@ -141,13 +142,13 @@ def _normalise_order_item(
 
     subject = result.pop("subject", None)
     if model._meta.model_name == "individual":
-        if subject not in {None, SELF_SUBJECT}:
+        if not is_one_of(subject, {None, SELF_SUBJECT}):
             raise ValidationError(
                 f"INDIVIDUAL enrolment_ranking.order_by[{index}].subject "
                 "must be self."
             )
         subject = None
-    elif subject is not None and subject not in ORDER_BY_MEMBER_SUBJECTS:
+    elif subject is not None and not is_one_of(subject, ORDER_BY_MEMBER_SUBJECTS):
         raise ValidationError(
             f"GROUP enrolment_ranking.order_by[{index}].subject must be "
             "head or primary_worker."
@@ -170,11 +171,11 @@ def _normalise_order_item(
                 f"key on the {subject}."
             )
         result["subject"] = subject
-    if result["direction"] not in SUPPORTED_DIRECTIONS:
+    if not is_one_of(result["direction"], SUPPORTED_DIRECTIONS):
         raise ValidationError(f"Unsupported ranking direction: {result['direction']}.")
-    if result.get("cast") not in ({None} | set(SUPPORTED_CASTS)):
+    if not is_one_of(result.get("cast"), {None} | set(SUPPORTED_CASTS)):
         raise ValidationError(f"Unsupported ranking cast: {result.get('cast')}.")
-    if result.get("nulls") not in ({None} | SUPPORTED_NULLS):
+    if not is_one_of(result.get("nulls"), {None} | SUPPORTED_NULLS):
         raise ValidationError(f"Unsupported ranking null placement: {result.get('nulls')}.")
     return result
 
@@ -327,14 +328,14 @@ def _validate_component_source(component, path, model):
     if phase_type == "GROUP":
         subjects |= set(MEMBER_SUBJECTS)
     subject = component.get("subject")
-    if subject is not None and subject not in subjects:
+    if subject is not None and not is_one_of(subject, subjects):
         raise ValidationError(
             f"{phase_type} {path}.subject must be one of "
             + ", ".join(sorted(subjects)) + "."
         )
     aggregate = component.get("aggregate")
     if subject == ANY_MEMBER_SUBJECT:
-        if aggregate not in COMPONENT_AGGREGATES:
+        if not is_one_of(aggregate, COMPONENT_AGGREGATES):
             raise ValidationError(
                 f"{path}.aggregate must be one of "
                 + ", ".join(sorted(COMPONENT_AGGREGATES))
@@ -349,7 +350,7 @@ def _validate_component_source(component, path, model):
 
 def _validate_derived_component(component, path, subject):
     derived = component["derived"]
-    if derived not in DERIVED_SCORE_VALUES:
+    if not is_one_of(derived, DERIVED_SCORE_VALUES):
         raise ValidationError(
             f"{path}.derived {derived} is not supported; supported values: "
             + ", ".join(sorted(DERIVED_SCORE_VALUES)) + "."
@@ -457,7 +458,7 @@ def _normalise_selection_strategy(selection_strategy, model):
             raise ValidationError(
                 "INDIVIDUAL selection_strategy.source must be SELF."
             )
-    elif source not in {PRIMARY_WORKER_SOURCE, HOUSEHOLD_HEAD_SOURCE}:
+    elif not is_one_of(source, {PRIMARY_WORKER_SOURCE, HOUSEHOLD_HEAD_SOURCE}):
         raise ValidationError(
             "GROUP selection_strategy.source must be PRIMARY_WORKER or "
             "HOUSEHOLD_HEAD."
@@ -641,12 +642,12 @@ def _normalise_quota_condition(condition, path, source):
     ):
         raise ValidationError(f"{path}.field must be a json_ext key.")
     value_type = condition.get("type")
-    if value_type not in VALUE_TYPES:
+    if not is_one_of(value_type, VALUE_TYPES):
         raise ValidationError(
             f"{path}.type must be one of "
             + ", ".join(sorted(VALUE_TYPES)) + "."
         )
-    if filter_name not in FILTERS_BY_TYPE[value_type]:
+    if not is_one_of(filter_name, FILTERS_BY_TYPE[value_type]):
         raise ValidationError(
             f"{path}.filter {filter_name} is not allowed for {value_type}."
         )
@@ -665,7 +666,7 @@ def _normalise_age_condition(condition, path):
     value = condition.get("value")
     if condition.get("type", "integer") != "integer":
         raise ValidationError(f"{path}.type must be integer for age.")
-    if filter_name not in FILTERS_BY_TYPE["integer"]:
+    if not is_one_of(filter_name, FILTERS_BY_TYPE["integer"]):
         raise ValidationError(f"{path}.filter {filter_name} is not allowed for age.")
     if type(value) is not int or not 0 <= value <= 120:
         raise ValidationError(f"{path}.value must be an age from 0 to 120.")
@@ -677,7 +678,7 @@ def _normalise_district_condition(condition, path):
     value = condition.get("value")
     if condition.get("type", "string") != "string":
         raise ValidationError(f"{path}.type must be string for district.")
-    if filter_name not in FILTERS_BY_TYPE["string"]:
+    if not is_one_of(filter_name, FILTERS_BY_TYPE["string"]):
         raise ValidationError(f"{path}.filter {filter_name} is not allowed for district.")
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{path}.value must be a district name.")
@@ -694,13 +695,12 @@ DERIVED_CONDITION_VALUES = {
 
 def normalise_derived_condition(condition, path):
     """Validate a ``derived`` condition and return its normalised form."""
-    normalise = DERIVED_CONDITION_VALUES.get(condition["derived"])
-    if normalise is None:
+    if not is_one_of(condition["derived"], DERIVED_CONDITION_VALUES):
         raise ValidationError(
             f"{path}.derived {condition['derived']} is not supported; "
             "supported values: " + ", ".join(sorted(DERIVED_CONDITION_VALUES)) + "."
         )
-    return normalise(condition, path)
+    return DERIVED_CONDITION_VALUES[condition["derived"]](condition, path)
 
 
 def derived_condition_q(condition, model):
