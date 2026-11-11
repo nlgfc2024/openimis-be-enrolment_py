@@ -12,6 +12,7 @@ from enrolment.services import (
     EnrolmentService,
     build_group_enrollment_queryset,
     build_individual_enrollment_queryset,
+    build_individual_enrolment_summary,
     build_individual_enrollment_selection,
     build_group_enrollment_selection,
 )
@@ -250,6 +251,27 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                     EnrolmentConfig._validate_config(
                         {**DEFAULT_CONFIG, "max_enrolment_score": value}
                     )
+
+    def test_minimum_score_is_validated(self):
+        valid = self._ranking_with_points(60, 40)
+        valid["minimum_score"] = 60
+        validate_ranking_spec(valid, Individual)
+
+        cases = [
+            ({"order_by": ["id"], "minimum_score": 60}, "minimum_score requires weighted_score"),
+            ({**valid, "minimum_score": 101}, "minimum_score cannot exceed 100"),
+            (
+                {**self._ranking_with_points(40, 30, normalise_to=70), "minimum_score": 75},
+                "minimum_score cannot exceed 70",
+            ),
+        ] + [
+            ({**valid, "minimum_score": value}, "minimum_score must be a positive number")
+            for value in (0, -1, True, "60", [60])
+        ]
+        for ranking, message in cases:
+            with self.subTest(message=message, minimum_score=ranking["minimum_score"]):
+                with self.assertRaisesMessage(ValidationError, message):
+                    validate_ranking_spec(ranking, Individual)
 
     def test_weighted_ranking_validation_requires_score_in_ordering(self):
         with self.assertRaisesMessage(ValidationError, "must include _weighted_score"):
@@ -1007,8 +1029,8 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
             }))
         return benefit_plan, {individual.id for individual in selected}
 
-    def _weighted_quota_plan(self, cap):
-        return self._ranked_plan(
+    def _weighted_quota_plan(self, cap, minimum_score=None):
+        plan = self._ranked_plan(
             self.user.username,
             payload_override={
                 "type": "INDIVIDUAL",
@@ -1050,6 +1072,11 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
                 },
             },
         )
+        if minimum_score is not None:
+            EnrolmentConfig.programme_profiles[plan.code]["ranking"]["ACTIVE"][
+                "minimum_score"
+            ] = minimum_score
+        return plan
 
     def _quota_candidate(self, rank, gender="Male", age=50):
         return create_verified_individual(self.user.username, {
@@ -1072,6 +1099,28 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         self.assertEqual(len(selected_ids), len(set(selected_ids)))
         self.assertLessEqual(len(selected_ids), benefit_plan.max_beneficiaries)
         return selection, queryset_ids
+
+    def test_candidates_below_the_minimum_score_are_cut_before_quotas(self):
+        # Ranks score rank / 7 * 100: 7 -> 100, 6 -> 85.7, 5 -> 71.4, 4 -> 57.1.
+        benefit_plan = self._weighted_quota_plan(cap=5, minimum_score=500 / 7)
+        highest = self._quota_candidate(7)
+        female = self._quota_candidate(6, gender="Female")
+        youth_at_minimum = self._quota_candidate(5, age=25)
+        # Both would fill a quota place, but neither reaches the minimum.
+        self._quota_candidate(4, gender="Female")
+        self._quota_candidate(3, age=25)
+
+        selection, selected_ids = self._selected_individual_ids(benefit_plan)
+
+        self.assertEqual(selected_ids, [highest.id, female.id, youth_at_minimum.id])
+        self.assertEqual(selection["pool_size"], 3)
+        self.assertEqual(selection["below_minimum_score"], 2)
+        self.assertEqual(selection["will_enrol"], 3)
+        summary = build_individual_enrolment_summary(
+            [], str(benefit_plan.id), "ACTIVE", self.user
+        )
+        self.assertEqual(summary["below_minimum_score"], 2)
+        self.assertEqual(summary["number_of_individuals_to_upload"], 3)
 
     def test_small_quota_cap_uses_floor_and_weighted_fallback(self):
         benefit_plan = self._weighted_quota_plan(cap=2)

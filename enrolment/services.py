@@ -232,6 +232,7 @@ def build_group_enrolment_summary(
 def _summary_metadata(selection):
     return {
         "pool_size": selection["pool_size"],
+        "below_minimum_score": selection["below_minimum_score"],
         "cap_applied": selection["cap_applied"],
         "will_enrol": selection["will_enrol"],
         "enrolment_ranking": selection["ranking"],
