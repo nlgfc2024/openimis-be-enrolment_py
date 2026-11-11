@@ -30,7 +30,7 @@ from enrolment.criteria import (
     criterion_to_condition,
     is_number,
 )
-from enrolment.district import district_name
+from enrolment.district import district_name, in_district
 from enrolment.membership import (
     ANY_MEMBER_SUBJECT,
     CANDIDATE_SUBJECTS,
@@ -628,14 +628,7 @@ def _normalise_quota_condition(condition, path, source):
         raise ValidationError(f"{path} must set exactly one of field or derived.")
 
     if "derived" in condition:
-        derived = DERIVED_QUOTA_VALUES.get(condition["derived"])
-        if derived is None:
-            raise ValidationError(
-                f"{path}.derived {condition['derived']} is not supported; "
-                "supported values: " + ", ".join(sorted(DERIVED_QUOTA_VALUES)) + "."
-            )
-        normalise, _ = derived
-        return normalise(condition, path)
+        return normalise_derived_condition(condition, path)
 
     filter_name = condition.get("filter")
     value = condition.get("value")
@@ -689,6 +682,36 @@ def _normalise_district_condition(condition, path):
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{path}.value must be a district name.")
     return {"derived": "district", "filter": filter_name, "value": value}
+
+
+# Derived values a condition may read in place of a json_ext field, in quota
+# conditions and profile eligibility criteria: name -> normaliser.
+DERIVED_CONDITION_VALUES = {
+    "age": _normalise_age_condition,
+    "district": _normalise_district_condition,
+}
+
+
+def normalise_derived_condition(condition, path):
+    """Validate a ``derived`` condition and return its normalised form."""
+    normalise = DERIVED_CONDITION_VALUES.get(condition["derived"])
+    if normalise is None:
+        raise ValidationError(
+            f"{path}.derived {condition['derived']} is not supported; "
+            "supported values: " + ", ".join(sorted(DERIVED_CONDITION_VALUES)) + "."
+        )
+    return normalise(condition, path)
+
+
+def derived_condition_q(condition, model):
+    """Filter households or individuals (``model``) on a normalised derived condition.
+
+    Age needs a date of birth, so it applies to individuals only.
+    """
+    if condition["derived"] == "age":
+        return _age_condition_q("dob", condition["filter"], condition["value"])
+    matching = in_district(model.objects.all(), condition["filter"], condition["value"])
+    return Q(pk__in=matching.values("pk"))
 
 
 def validate_ranking_spec(ranking, model, beneficiary_schema=None):
@@ -1032,19 +1055,14 @@ def _district_quota_q(condition):
     """Match source people whose location lies in the named district."""
     from individual.models import Individual
 
-    in_district = Individual.objects.annotate(
-        _enrolment_district=district_name()
-    ).filter(**{
-        f"_enrolment_district__{condition['filter']}": condition["value"],
-    })
-    return Q(_selection_individual__in=in_district.values("id"))
+    matching = in_district(Individual.objects.all(), condition["filter"], condition["value"])
+    return Q(_selection_individual__in=matching.values("id"))
 
 
-# Derived values a quota condition may use: name -> (validate and normalise
-# the condition, build its filter on the annotated selection source).
-DERIVED_QUOTA_VALUES = {
-    "age": (_normalise_age_condition, _age_quota_q),
-    "district": (_normalise_district_condition, _district_quota_q),
+# How each derived value filters the annotated selection source of a quota.
+DERIVED_QUOTA_FILTERS = {
+    "age": _age_quota_q,
+    "district": _district_quota_q,
 }
 
 
@@ -1056,8 +1074,7 @@ def _quota_q(conditions):
     field_conditions = []
     for condition in conditions:
         if "derived" in condition:
-            _, condition_q = DERIVED_QUOTA_VALUES[condition["derived"]]
-            query &= condition_q(condition)
+            query &= DERIVED_QUOTA_FILTERS[condition["derived"]](condition)
         else:
             field_conditions.append(criterion_to_condition(condition))
     if field_conditions:

@@ -65,6 +65,17 @@ def district_name(location_path="location"):
     )
 
 
+def in_district(queryset, filter_name, value):
+    """Return the rows of ``queryset`` whose district name matches a filter.
+
+    ``queryset`` holds households or individuals; each is placed by its own
+    ``location`` (see ``district_name``).
+    """
+    return queryset.annotate(_enrolment_district=district_name()).filter(
+        **{f"_enrolment_district__{filter_name}": value}
+    )
+
+
 def scoped_groups(query, user):
     """Use the household search access policy, including its missing-location rule."""
     if user is None or user.is_anonymous:
