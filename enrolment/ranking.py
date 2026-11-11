@@ -54,6 +54,9 @@ SUPPORTED_CASTS = {
 SUPPORTED_DIRECTIONS = {"asc", "desc"}
 SUPPORTED_NULLS = {"first", "last"}
 WEIGHTED_SCORE_FIELD = "_weighted_score"
+# Scores are floats built from weight / maximum-points ratios, so a candidate
+# exactly at the minimum can compute a hair below it.
+SCORE_TOLERANCE = 1e-9
 # Rankings come from programme profiles only; a Phase can no longer hold one.
 RETIRED_PHASE_RANKING_MESSAGE = (
     "Set the ranking in the programme profile instead "
@@ -185,6 +188,20 @@ def _normalise_order_item(
 def _positive_number(value, path):
     if not is_number(value) or value <= 0:
         raise ValidationError(f"{path} must be a positive number.")
+
+
+def _validate_minimum_score(minimum_score, weighted_score):
+    if minimum_score is None:
+        return
+    if weighted_score is None:
+        raise ValidationError("enrolment_ranking.minimum_score requires weighted_score.")
+    _positive_number(minimum_score, "enrolment_ranking.minimum_score")
+    highest = weighted_score.get("normalise_to", 100)
+    if minimum_score > highest:
+        raise ValidationError(
+            f"enrolment_ranking.minimum_score cannot exceed {highest:g}, the "
+            "highest score weighted_score.normalise_to allows."
+        )
 
 
 def _validate_score_source(score_source, model):
@@ -725,6 +742,7 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         "limit",
         "score_source",
         "weighted_score",
+        "minimum_score",
         "selection_strategy",
     }
     if unexpected:
@@ -740,6 +758,7 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
     _validate_score_source(score_source, model)
     if weighted_score is not None:
         _validate_weighted_score(weighted_score, model, score_source)
+    _validate_minimum_score(ranking.get("minimum_score"), weighted_score)
     if ranking.get("selection_strategy") is not None:
         _normalise_selection_strategy(ranking["selection_strategy"], model)
 
@@ -1261,6 +1280,7 @@ def rank_and_cap_queryset(
     if ranking is None:
         return queryset, {
             "pool_size": pool_size,
+            "below_minimum_score": 0,
             "cap_applied": None,
             "will_enrol": pool_size,
             "ranking": None,
@@ -1275,6 +1295,21 @@ def rank_and_cap_queryset(
     )
     weighted_score = ranking.get("weighted_score")
     score_source = ranking.get("score_source")
+    minimum_score = ranking.get("minimum_score")
+    below_minimum_score = 0
+    if minimum_score is not None:
+        # Candidates below the minimum are not part of the pool: the cap,
+        # percentage limit and quotas only ever see those who reach it.
+        reaching = build_weighted_score(queryset, weighted_score, score_source).filter(
+            **{f"{WEIGHTED_SCORE_FIELD}__gte": minimum_score - SCORE_TOLERANCE}
+        )
+        queryset = queryset.filter(id__in=reaching.values("id"))
+        try:
+            reaching_count = queryset.count()
+        except DataError as exc:
+            _cast_error(order_items, exc, weighted_score)
+        below_minimum_score = pool_size - reaching_count
+        pool_size = reaching_count
 
     def apply_ranking(source_queryset):
         if weighted_score is not None:
@@ -1307,6 +1342,7 @@ def rank_and_cap_queryset(
         capped = apply_ranking(queryset.filter(id__in=selected_ids))
         return capped, {
             "pool_size": pool_size,
+            "below_minimum_score": below_minimum_score,
             "cap_applied": cap if has_limit else None,
             "will_enrol": len(selected_ids),
             "ranking": ranking,
@@ -1340,6 +1376,7 @@ def rank_and_cap_queryset(
         capped = apply_ranking(queryset.filter(id__in=capped_ids))
     return capped, {
         "pool_size": pool_size,
+        "below_minimum_score": below_minimum_score,
         "cap_applied": cap if has_limit else None,
         "will_enrol": will_enrol,
         "ranking": ranking,
