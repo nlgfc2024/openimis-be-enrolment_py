@@ -38,6 +38,16 @@ class GroupSummaryEnrolmentGQLType(graphene.ObjectType):
     percentage = graphene.Float()
 
 
+class ProgrammeProfileGQLType(graphene.ObjectType):
+    key = graphene.String()
+    description = graphene.String()
+    criteria = graphene.JSONString()
+    ranking = graphene.JSONString()
+    ranking_status = graphene.String()
+    unsuitable_reasons = graphene.List(graphene.String)
+    profile_required = graphene.Boolean()
+
+
 # American-spelling compatibility.
 IndividualSummaryEnrollmentGQLType = IndividualSummaryEnrolmentGQLType
 GroupSummaryEnrollmentGQLType = GroupSummaryEnrolmentGQLType
