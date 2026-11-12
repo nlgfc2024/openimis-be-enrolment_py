@@ -184,6 +184,13 @@ The individual and group enrolment summaries report, besides the counts:
 - `enrolmentRanking`: the ranking that applied, including any member
   `subject` in `order_by`.
 
+`enrolmentProgrammeProfile(benefitPlanId, status)` returns the profile rules
+that apply to a Phase and beneficiary status, for showing on the Phase: `key`
+(null when no profile applies), `description`, the eligibility `criteria`
+with their subjects, the `ranking` for that status and the `rankingStatus` it
+came from (the status or `*`), `unsuitableReasons` if the Phase's type cannot
+use the profile, and `profileRequired`. It needs the Benefit Plan read right.
+
 ## Weighted scores
 
 `weighted_score.components` lists the score items. Each item reads one value,

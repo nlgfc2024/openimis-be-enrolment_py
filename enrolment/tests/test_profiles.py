@@ -1,4 +1,5 @@
 import copy
+import json
 from datetime import date
 from unittest.mock import Mock, patch
 
@@ -8,11 +9,13 @@ from django.test import SimpleTestCase, TestCase
 
 from individual.models import Group, Individual
 from individual.tests.test_helpers import (
+    BaseTestContext,
     IndividualGQLTestCase,
     add_individual_to_group,
     create_group,
     create_individual,
 )
+from social_protection.apps import SocialProtectionConfig
 from social_protection.models import BenefitPlanDataUploadRecords, GroupBeneficiary
 from social_protection.tests.test_helpers import create_benefit_plan
 from tasks_management.models import Task
@@ -26,6 +29,7 @@ from enrolment.profiles import (
 )
 from enrolment.services import EnrolmentService, build_group_enrolment_selection
 from enrolment.tests.helpers import create_village_in
+from openIMIS.schema import schema as assembled_schema
 
 
 def _age(filter_name, value, **overrides):
@@ -625,6 +629,66 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
 
         # Lowest PMT first, so the household created second takes the place.
         self.assertEqual(self._eligible(plan), {poorer.id})
+
+    def _profile_query(self, plan, user=None):
+        result = assembled_schema.execute(
+            f'''{{ enrolmentProgrammeProfile(benefitPlanId: "{plan.id}", status: "ACTIVE") {{
+                key description criteria ranking rankingStatus unsuitableReasons profileRequired
+            }} }}''',
+            context_value=BaseTestContext(user=user or self.admin_user).request,
+        )
+        if result.errors:
+            return None, result.errors
+        profile = result.data["enrolmentProgrammeProfile"]
+        for key in ("criteria", "ranking"):
+            profile[key] = json.loads(profile[key]) if profile[key] else profile[key]
+        return profile, None
+
+    def test_the_profile_query_describes_the_rules_for_a_phase(self):
+        experienced = _criterion(
+            subject="primary_worker", field="business_experience", value="Yes",
+        )
+        head_pmt = {"order_by": [{
+            "subject": "head", "field": "household_pmt_score", "cast": "float",
+            "direction": "asc", "nulls": "last",
+        }]}
+        plan = self._plan("profile-query", [experienced], ranking=head_pmt)
+        EnrolmentConfig.programme_profiles[plan.code]["description"] = "RMEP"
+
+        profile, errors = self._profile_query(plan)
+
+        self.assertIsNone(errors)
+        self.assertEqual(profile, {
+            "key": plan.code,
+            "description": "RMEP",
+            "criteria": [experienced],
+            "ranking": head_pmt,
+            "rankingStatus": "*",
+            "unsuitableReasons": [],
+            "profileRequired": False,
+        })
+
+    def test_the_profile_query_reports_no_profile_and_unsuitable_profiles(self):
+        plan = self._plan("profile-query-none", [])
+        EnrolmentConfig.programme_profiles = {}
+        profile, _ = self._profile_query(plan)
+        self.assertEqual(
+            (profile["key"], profile["criteria"], profile["ranking"], profile["rankingStatus"]),
+            (None, [], None, None),
+        )
+
+        self._set_profile(plan, [_criterion(subject="self")])
+        profile, _ = self._profile_query(plan)
+        self.assertEqual(
+            profile["unsuitableReasons"], ["eligibility.criteria[0] uses subject self"],
+        )
+
+    def test_the_profile_query_needs_the_benefit_plan_read_right(self):
+        plan = self._plan("profile-query-rights", [])
+        # The district user's role does not hold the Benefit Plan read right.
+        self.assertFalse(self.dist_a_user.has_perms(SocialProtectionConfig.gql_benefit_plan_search_perms))
+        _, errors = self._profile_query(plan, user=self.dist_a_user)
+        self.assertIn("Unauthorized", str(errors))
 
     def _submit_then_narrow_the_profile(self, token):
         """Submit two households, then narrow the profile so one no longer fits."""

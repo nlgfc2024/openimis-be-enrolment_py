@@ -292,6 +292,31 @@ def resolve_programme_profile(benefit_plan):
     return None, None
 
 
+def programme_profile_for_phase(benefit_plan, status):
+    """Describe the profile rules that apply to a Phase and beneficiary status.
+
+    For showing on the Phase: the profile key (None when no profile applies),
+    its description and eligibility criteria, the ranking for ``status`` and
+    the ranking key it came from (the status or ``*``), and why the Phase's
+    type cannot use the profile, if it cannot.
+    """
+    key, profile = resolve_programme_profile(benefit_plan)
+    profile = profile or {}
+    rankings = profile.get("ranking") or {}
+    ranking_status = status if status in rankings else ("*" if "*" in rankings else None)
+    return {
+        "key": key,
+        "description": profile.get("description"),
+        "criteria": (profile.get("eligibility") or {}).get("criteria") or [],
+        "ranking": rankings.get(ranking_status) if ranking_status else None,
+        "ranking_status": ranking_status,
+        "unsuitable_reasons": (
+            phase_type_errors(profile, benefit_plan.type) if key is not None else []
+        ),
+        "profile_required": bool(EnrolmentConfig.require_programme_profile),
+    }
+
+
 def profile_ranking_spec(benefit_plan, status):
     """Return the Phase's profile ranking for ``status`` (or ``*``), if any."""
     _, profile = resolve_programme_profile(benefit_plan)
