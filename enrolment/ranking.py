@@ -1137,6 +1137,10 @@ def _select_quota_ids(ranked, selection_strategy, cap):
     ``ranked`` already carries the configured weighted/deterministic ordering.
     Each bucket and the fallback retain that ordering, and exclusions ensure one
     beneficiary cannot occupy more than one place.
+
+    Returns the selected ids and how the places filled: for each bucket the
+    places it reserved and filled, and how many went to the next ranked
+    candidates (``unreserved``).
     """
     strategy = _normalise_selection_strategy(
         selection_strategy,
@@ -1144,30 +1148,35 @@ def _select_quota_ids(ranked, selection_strategy, cap):
     )
     candidates = _annotate_selection_source(ranked, strategy["source"])
     selected_ids = []
+    buckets = []
 
     for quota in strategy["quotas"]:
         target = quota.get("count")
         if target is None:
             target = math.floor(cap * quota["percentage"] / 100)
-        target = min(target, cap - len(selected_ids))
-        if target <= 0:
-            continue
-        selected_ids.extend(
-            candidates.exclude(id__in=selected_ids).filter(
-                _quota_q(quota["when"])
-            ).values_list("id", flat=True)[:target]
-        )
+        target = max(0, min(target, cap - len(selected_ids)))
+        filled = []
+        if target:
+            filled = list(
+                candidates.exclude(id__in=selected_ids).filter(
+                    _quota_q(quota["when"])
+                ).values_list("id", flat=True)[:target]
+            )
+            selected_ids.extend(filled)
+        buckets.append({"key": quota["key"], "reserved": target, "filled": len(filled)})
 
     # Places the buckets leave unfilled always go to the next ranked candidates,
     # so the Phase reaches its target whenever enough candidates are eligible.
     remaining = cap - len(selected_ids)
+    unreserved = []
     if remaining:
-        selected_ids.extend(
+        unreserved = list(
             candidates.exclude(id__in=selected_ids).values_list(
                 "id", flat=True
             )[:remaining]
         )
-    return selected_ids
+        selected_ids.extend(unreserved)
+    return selected_ids, {"buckets": buckets, "unreserved": len(unreserved)}
 
 
 def calculate_cap(
@@ -1266,7 +1275,7 @@ def rank_and_cap_queryset(
     Approval revalidation can disable the percentage limit after it was applied
     during confirmation without disabling the remaining capacity limit.
     """
-    from enrolment.profiles import profile_ranking_spec
+    from enrolment.profiles import profile_ranking_spec, resolve_programme_profile
 
     if holds_phase_ranking(benefit_plan.json_ext):
         # Refuse rather than ignore it: without the ranking the Phase would
@@ -1276,11 +1285,14 @@ def rank_and_cap_queryset(
             f"is no longer applied, so it cannot enrol. {RETIRED_PHASE_RANKING_MESSAGE}"
         )
     ranking = profile_ranking_spec(benefit_plan, status)
+    profile_key = resolve_programme_profile(benefit_plan)[0]
     pool_size = queryset.count()
     if ranking is None:
         return queryset, {
             "pool_size": pool_size,
             "below_minimum_score": 0,
+            "programme_profile": profile_key,
+            "quota_fill": None,
             "cap_applied": None,
             "will_enrol": pool_size,
             "ranking": None,
@@ -1332,7 +1344,7 @@ def rank_and_cap_queryset(
     selection_strategy = ranking.get("selection_strategy")
     if selection_strategy is not None:
         try:
-            selected_ids = _select_quota_ids(
+            selected_ids, quota_fill = _select_quota_ids(
                 ranked,
                 selection_strategy,
                 will_enrol,
@@ -1343,6 +1355,8 @@ def rank_and_cap_queryset(
         return capped, {
             "pool_size": pool_size,
             "below_minimum_score": below_minimum_score,
+            "programme_profile": profile_key,
+            "quota_fill": quota_fill,
             "cap_applied": cap if has_limit else None,
             "will_enrol": len(selected_ids),
             "ranking": ranking,
@@ -1377,6 +1391,8 @@ def rank_and_cap_queryset(
     return capped, {
         "pool_size": pool_size,
         "below_minimum_score": below_minimum_score,
+        "programme_profile": profile_key,
+        "quota_fill": None,
         "cap_applied": cap if has_limit else None,
         "will_enrol": will_enrol,
         "ranking": ranking,

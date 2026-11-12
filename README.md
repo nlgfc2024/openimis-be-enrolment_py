@@ -170,6 +170,20 @@ Editing a profile while an enrolment awaits approval therefore changes only
 later enrolments. Tasks submitted before this was recorded are re-checked
 against the current profile.
 
+## Enrolment summary
+
+The individual and group enrolment summaries report, besides the counts:
+
+- `programmeProfile`: the key of the profile that applied, or null.
+- `poolSize`, `capApplied`, `willEnrol` and `belowMinimumScore` (see
+  [Weighted scores](#weighted-scores)).
+- `quotaFill`, when the ranking has a `selection_strategy`: for each quota
+  bucket the places it `reserved` and `filled`, in order, and how many places
+  went to the next ranked candidates (`unreserved`). For example
+  `{"buckets": [{"key": "female", "reserved": 3, "filled": 2}], "unreserved": 7}`.
+- `enrolmentRanking`: the ranking that applied, including any member
+  `subject` in `order_by`.
+
 ## Weighted scores
 
 `weighted_score.components` lists the score items. Each item reads one value,
