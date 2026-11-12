@@ -1121,6 +1121,16 @@ class AuthoritativeEnrollmentTest(ProfileRankingMixin, TestCase):
         )
         self.assertEqual(summary["below_minimum_score"], 2)
         self.assertEqual(summary["number_of_individuals_to_upload"], 3)
+        # Quota percentages apply to the 3 places left after the cut: one
+        # female and one youth place, and the third to the next ranked.
+        self.assertEqual(summary["quota_fill"], {
+            "buckets": [
+                {"key": "female", "reserved": 1, "filled": 1},
+                {"key": "youth", "reserved": 1, "filled": 1},
+            ],
+            "unreserved": 1,
+        })
+        self.assertEqual(summary["programme_profile"], benefit_plan.code)
 
     def test_small_quota_cap_uses_floor_and_weighted_fallback(self):
         benefit_plan = self._weighted_quota_plan(cap=2)
