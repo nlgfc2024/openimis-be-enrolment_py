@@ -23,6 +23,7 @@ from enrolment.persistence import (
     EnrollmentPersistenceService,
     calculate_percentage_of_invalid_items,
 )
+from enrolment.profiles import profile_as_submitted, profile_snapshot
 from enrolment.ranking import ages_on
 
 
@@ -57,6 +58,7 @@ def _start_approval_workflow(
     business_event,
     label,
     custom_filters,
+    benefit_plan,
 ):
     task_result = TaskService(user).create({
         "source": "import_valid_items",
@@ -74,6 +76,7 @@ def _start_approval_workflow(
             "benefit_plan_id": str(upload_record.benefit_plan_id),
             "beneficiary_status": status,
             "custom_filters": list(custom_filters or []),
+            "programme_profile": profile_snapshot(benefit_plan),
         },
     })
     if not task_result or not task_result.get("success"):
@@ -121,6 +124,7 @@ def confirm_individual_enrolment(custom_filters, benefit_plan_id, status, user):
             business_event,
             "individual",
             custom_filters,
+            benefit_plan,
         )
         result["confirmation"] = {
             "mode": "maker_checker",
@@ -173,6 +177,7 @@ def confirm_group_enrolment(custom_filters, benefit_plan_id, status, user):
             business_event,
             "group",
             custom_filters,
+            benefit_plan,
         )
         result["confirmation"] = {
             "mode": "maker_checker",
@@ -359,9 +364,11 @@ def on_task_complete_enrolment(**kwargs):
 
         # The nested atomic block creates a savepoint. Catching below can mark
         # the workflow failed without committing beneficiaries written before a
-        # later reporting or persistence error. Ages are re-checked on the day
-        # of submission, so an approval delay cannot age a candidate out.
-        with transaction.atomic(), ages_on(_submission_date(upload_record)):
+        # later reporting or persistence error. Ages and the programme profile
+        # are re-checked as they were when the enrolment was submitted, so an
+        # approval delay or a profile edit meanwhile does not change the rules.
+        with transaction.atomic(), ages_on(_submission_date(upload_record)), \
+                profile_as_submitted(task_data.get("programme_profile")):
             benefit_plan = BenefitPlan.objects.select_for_update().get(
                 id=task_data["benefit_plan_id"]
             )

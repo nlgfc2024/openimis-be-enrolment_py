@@ -163,6 +163,13 @@ against current registry and beneficiary data in the same transaction. Ages
 are still worked out on the day the enrolment was submitted, so a candidate
 who met an age rule then is not refused because approval came later.
 
+The approval task also records the programme profile that applied when the
+enrolment was submitted (`json_ext.programme_profile`: its key and content,
+or a `null` key if none applied), and approval re-checks against that copy.
+Editing a profile while an enrolment awaits approval therefore changes only
+later enrolments. Tasks submitted before this was recorded are re-checked
+against the current profile.
+
 ## Weighted scores
 
 `weighted_score.components` lists the score items. Each item reads one value,

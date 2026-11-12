@@ -8,6 +8,10 @@ A profile does not name a Phase type. The types it suits follow from its
 content (for example, a ``head`` criterion only suits GROUP Phases), and a
 profile that suits neither is rejected when the configuration is saved.
 """
+import copy
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 from django.core.exceptions import ValidationError
 from django.db.models import Exists, OuterRef
 
@@ -241,8 +245,43 @@ def _criterion_errors(criterion, path):
     return []
 
 
+# The profile an enrolment was submitted under, while its approval re-checks it.
+_SUBMITTED_PROFILE = ContextVar("enrolment_submitted_profile", default=None)
+
+
+def profile_snapshot(benefit_plan):
+    """Return the Phase's profile as it applies now, for an approval task.
+
+    ``{"key": None, "profile": None}`` records that no profile applied.
+    """
+    key, profile = resolve_programme_profile(benefit_plan)
+    return {"key": key, "profile": copy.deepcopy(profile)}
+
+
+@contextmanager
+def profile_as_submitted(snapshot):
+    """Resolve every Phase's profile to ``snapshot`` within the block.
+
+    Approval re-checks an enrolment under the profile it was submitted with, so
+    a profile edited while the enrolment awaits approval does not change the
+    rules. ``None`` (a task submitted before snapshots were kept) leaves the
+    current configuration in use.
+    """
+    if snapshot is None:
+        yield
+        return
+    token = _SUBMITTED_PROFILE.set(snapshot)
+    try:
+        yield
+    finally:
+        _SUBMITTED_PROFILE.reset(token)
+
+
 def resolve_programme_profile(benefit_plan):
     """Return ``(key, profile)`` for a Phase, or ``(None, None)`` if none applies."""
+    snapshot = _SUBMITTED_PROFILE.get()
+    if snapshot is not None:
+        return snapshot["key"], snapshot["profile"]
     profiles = EnrolmentConfig.programme_profiles or {}
     code = str(benefit_plan.code or "").upper()
     for key, profile in profiles.items():
@@ -264,7 +303,9 @@ def apply_profile_eligibility(queryset, benefit_plan, phase_type):
     """Restrict candidates to the eligibility rules of the Phase's profile."""
     key, profile = resolve_programme_profile(benefit_plan)
     if profile is None:
-        if EnrolmentConfig.require_programme_profile:
+        # An enrolment submitted without a profile was allowed to be, even if
+        # require_programme_profile has been turned on since.
+        if EnrolmentConfig.require_programme_profile and _SUBMITTED_PROFILE.get() is None:
             raise ValidationError(
                 f"Phase {benefit_plan.code} matches no programme profile, and "
                 "require_programme_profile is on."
