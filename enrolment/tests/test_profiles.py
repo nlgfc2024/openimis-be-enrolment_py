@@ -626,9 +626,8 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
         # Lowest PMT first, so the household created second takes the place.
         self.assertEqual(self._eligible(plan), {poorer.id})
 
-    @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
-    def test_approval_rechecks_a_profile_changed_after_confirmation(self):
-        token = "profile-approval"
+    def _submit_then_narrow_the_profile(self, token):
+        """Submit two households, then narrow the profile so one no longer fits."""
         experienced = _criterion(
             subject="primary_worker", field="business_experience", value="Yes",
         )
@@ -648,12 +647,36 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
             benefit_plan=plan, workflow="Enrollment", is_deleted=False
         )
         task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
-        # The profile is narrowed while the enrolment awaits approval, so the
-        # staged farming household is no longer eligible.
         self._set_profile(plan, [
             experienced,
             _criterion(subject="primary_worker", field="sector", value="Retail"),
         ])
+        self.assertEqual(self._eligible(plan), {retail.id})
+        return plan, task, {retail.id, farming.id}
+
+    @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
+    def test_approval_uses_the_profile_the_enrolment_was_submitted_with(self):
+        plan, task, submitted = self._submit_then_narrow_the_profile("profile-approval")
+        self.assertEqual(task.json_ext["programme_profile"]["key"], plan.code)
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(
+            set(GroupBeneficiary.objects.filter(
+                benefit_plan=plan, is_deleted=False
+            ).values_list("group_id", flat=True)),
+            submitted,
+        )
+
+    @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
+    def test_a_task_without_a_profile_snapshot_uses_the_current_profile(self):
+        # Tasks submitted before snapshots were kept are re-checked as before.
+        plan, task, _ = self._submit_then_narrow_the_profile("profile-no-snapshot")
+        json_ext = dict(task.json_ext)
+        del json_ext["programme_profile"]
+        Task.objects.filter(id=task.id).update(json_ext=json_ext)
 
         TaskService(self.admin_user).complete_task({"id": task.id})
 
