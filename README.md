@@ -165,10 +165,23 @@ who met an age rule then is not refused because approval came later.
 
 The approval task also records the programme profile that applied when the
 enrolment was submitted (`json_ext.programme_profile`: its key and content,
-or a `null` key if none applied), and approval re-checks against that copy.
-Editing a profile while an enrolment awaits approval therefore changes only
-later enrolments. Tasks submitted before this was recorded are re-checked
-against the current profile.
+or a `null` key if none applied), and approval applies that copy's eligibility
+criteria and ranking. Editing a profile while an enrolment awaits approval
+therefore changes only later enrolments. Tasks submitted before this was
+recorded are re-checked against the current profile.
+
+Only the profile is recorded. The instance settings it relies on are read again
+at approval: `district_location_type`, the registry verification fields and
+values, `registry_gender_field` and `max_enrolment_score`. Approval is all or
+nothing (every staged candidate must still be eligible and selected), so
+changing one of these while an enrolment awaits approval cannot enrol a
+different group; it can only make the approval fail.
+
+To withdraw an enrolment awaiting approval, for example one submitted under a
+profile that has since been corrected, the checker rejects its task. The task
+ends `FAILED`, nobody is enrolled, and the Phase accepts a new confirmation,
+which records the profile as it is then. Only one enrolment per Phase can await
+approval at a time.
 
 ## Enrolment summary
 
