@@ -163,6 +163,47 @@ against current registry and beneficiary data in the same transaction. Ages
 are still worked out on the day the enrolment was submitted, so a candidate
 who met an age rule then is not refused because approval came later.
 
+The approval task also records the programme profile that applied when the
+enrolment was submitted (`json_ext.programme_profile`: its key and content,
+or a `null` key if none applied), and approval applies that copy's eligibility
+criteria and ranking. Editing a profile while an enrolment awaits approval
+therefore changes only later enrolments. Tasks submitted before this was
+recorded are re-checked against the current profile.
+
+Only the profile is recorded. The instance settings it relies on are read again
+at approval: `district_location_type`, the registry verification fields and
+values, `registry_gender_field` and `max_enrolment_score`. Approval is all or
+nothing (every staged candidate must still be eligible and selected), so
+changing one of these while an enrolment awaits approval cannot enrol a
+different group; it can only make the approval fail.
+
+To withdraw an enrolment awaiting approval, for example one submitted under a
+profile that has since been corrected, the checker rejects its task. The task
+ends `FAILED`, nobody is enrolled, and the Phase accepts a new confirmation,
+which records the profile as it is then. Only one enrolment per Phase can await
+approval at a time.
+
+## Enrolment summary
+
+The individual and group enrolment summaries report, besides the counts:
+
+- `programmeProfile`: the key of the profile that applied, or null.
+- `poolSize`, `capApplied`, `willEnrol` and `belowMinimumScore` (see
+  [Weighted scores](#weighted-scores)).
+- `quotaFill`, when the ranking has a `selection_strategy`: for each quota
+  bucket the places it `reserved` and `filled`, in order, and how many places
+  went to the next ranked candidates (`unreserved`). For example
+  `{"buckets": [{"key": "female", "reserved": 3, "filled": 2}], "unreserved": 7}`.
+- `enrolmentRanking`: the ranking that applied, including any member
+  `subject` in `order_by`.
+
+`enrolmentProgrammeProfile(benefitPlanId, status)` returns the profile rules
+that apply to a Phase and beneficiary status, for showing on the Phase: `key`
+(null when no profile applies), `description`, the eligibility `criteria`
+with their subjects, the `ranking` for that status and the `rankingStatus` it
+came from (the status or `*`), `unsuitableReasons` if the Phase's type cannot
+use the profile, and `profileRequired`. It needs the Benefit Plan read right.
+
 ## Weighted scores
 
 `weighted_score.components` lists the score items. Each item reads one value,

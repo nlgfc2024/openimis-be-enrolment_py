@@ -5,6 +5,8 @@ from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import PermissionDenied
 
 from individual.apps import IndividualConfig
+from social_protection.apps import SocialProtectionConfig
+from social_protection.models import BenefitPlan
 from individual.gql_queries import GroupGQLType, IndividualGQLType
 from core.schema import OrderedDjangoFilterConnectionField
 
@@ -15,7 +17,9 @@ from enrolment.gql_mutations import (
 from enrolment.gql_types import (
     GroupSummaryEnrolmentGQLType,
     IndividualSummaryEnrolmentGQLType,
+    ProgrammeProfileGQLType,
 )
+from enrolment.profiles import programme_profile_for_phase
 from enrolment.services import (
     build_group_enrolment_selection,
     build_group_enrolment_summary,
@@ -58,6 +62,25 @@ class Query(graphene.ObjectType):
         benefitPlanId=graphene.String(required=True),
         status=graphene.String(required=True),
     )
+    enrolment_programme_profile = graphene.Field(
+        ProgrammeProfileGQLType,
+        benefitPlanId=graphene.String(required=True),
+        status=graphene.String(required=True),
+    )
+
+    def resolve_enrolment_programme_profile(self, info, **kwargs):
+        _check_permissions(
+            info.context.user,
+            SocialProtectionConfig.gql_benefit_plan_search_perms,
+        )
+        benefit_plan = BenefitPlan.objects.filter(
+            id=kwargs["benefitPlanId"], is_deleted=False,
+        ).first()
+        if benefit_plan is None:
+            return None
+        return ProgrammeProfileGQLType(
+            **programme_profile_for_phase(benefit_plan, kwargs["status"])
+        )
 
     def resolve_individual_enrollment_summary(self, info, **kwargs):
         _check_permissions(
