@@ -734,6 +734,64 @@ class ProgrammeProfileEnrolmentTest(IndividualGQLTestCase):
             submitted,
         )
 
+    def _approve(self, plan):
+        """Approve the Phase's pending enrolment; return its task and the enrolled groups."""
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+        TaskService(self.admin_user).complete_task({"id": task.id})
+        task.refresh_from_db()
+        enrolled = set(GroupBeneficiary.objects.filter(
+            benefit_plan=plan, is_deleted=False
+        ).values_list("group_id", flat=True))
+        return task, enrolled
+
+    @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
+    def test_approval_uses_the_ranking_the_enrolment_was_submitted_with(self):
+        token = "profile-approval-ranking"
+        plan = self._plan(token, [])
+        richer, poorer = self._households_by_head_pmt(token)
+        EnrolmentService(self.admin_user).select_groups_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        # A minimum score added meanwhile would now cut the household whose head
+        # scores no points.
+        self._set_profile(plan, [], ranking={
+            "weighted_score": {"normalise_to": 10, "components": [{
+                "subject": "head", "field": "household_pmt_score", "weight": 10,
+                "scoring": {"type": "numeric_bands", "bands": [{"min": 20, "points": 10}]},
+            }]},
+            "minimum_score": 5,
+            "order_by": [{"field": "_weighted_score", "direction": "desc"}],
+        })
+        self.assertEqual(self._eligible(plan), {richer.id})
+
+        task, enrolled = self._approve(plan)
+
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(enrolled, {richer.id, poorer.id})
+
+    @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
+    def test_an_enrolment_submitted_without_a_profile_is_approved_without_one(self):
+        token = "profile-approval-none"
+        plan = self._plan(token, [])
+        EnrolmentConfig.programme_profiles = {}
+        retail = self._household(token, [{"sector": "Retail"}])
+        farming = self._household(token, [{"sector": "Farming"}])
+        EnrolmentService(self.admin_user).select_groups_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        # A profile added meanwhile would now exclude the farming household.
+        self._set_profile(plan, [_criterion(subject="primary_worker", field="sector", value="Retail")])
+        self.assertEqual(self._eligible(plan), {retail.id})
+
+        task, enrolled = self._approve(plan)
+
+        self.assertEqual(task.json_ext["programme_profile"], {"key": None, "profile": None})
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(enrolled, {retail.id, farming.id})
+
     @patch.object(EnrolmentConfig, "enable_maker_checker_logic_enrollment", True)
     def test_a_task_without_a_profile_snapshot_uses_the_current_profile(self):
         # Tasks submitted before snapshots were kept are re-checked as before.
