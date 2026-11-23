@@ -1,27 +1,19 @@
 name: Module CI
-
+# Runs this module's tests inside the Malawi backend assembly. The steps live in one
+# shared workflow on the hub, so CI fixes are made there once:
+# https://github.com/nlgfc2024/openimis-be_py/blob/mw/develop/.github/workflows/ci_module.yml
 on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
     branches:
-      - main
-      - develop
-      - 'release/**'
-      - 'feature/**'
-      - 'feat/**'
+      - mw/develop
+      - jobs-now/develop
+      - umep/develop
+      - 'release/mw/**'
   workflow_dispatch:
 
 jobs:
   call:
-    name: Default CI Flow
+    name: Malawi CI
     uses: nlgfc2024/openimis-be_py/.github/workflows/ci_module.yml@mw/develop
-    secrets:
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-    with:
-      SONAR_PROJECT_KEY: nlgfc2024_openimis-be-enrolment_py
-      SONAR_ORGANIZATION: openimis-1
-      SONAR_PROJECT_NAME: openimis-be-enrolment_py
-      SONAR_PROJECT_VERSION: 0.1
-      SONAR_SOURCES: enrolment
-      SONAR_EXCLUSIONS: "**/migrations/**,**/tests/**"

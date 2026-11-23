@@ -11,8 +11,17 @@ from core.module_config_registry import register_reloader, register_validator
 logger = logging.getLogger(__name__)
 
 
+# Replaced by programme_profiles. Its criteria are no longer applied, so a
+# configuration that still holds some is rejected on save. One already stored
+# is only logged when it is loaded, so the backend still starts.
+RETIRED_MANDATORY_CRITERIA_KEY = "mandatory_enrollment_criteria"
+RETIRED_MANDATORY_CRITERIA_MESSAGE = (
+    "mandatory_enrollment_criteria is no longer applied. Move its criteria to a "
+    "programme profile's eligibility.criteria (or to a Phase's advanced_criteria "
+    "for a single beneficiary status), then remove the key."
+)
+
 DEFAULT_CONFIG = {
-    "mandatory_enrollment_criteria": {"INDIVIDUAL": {}, "GROUP": {}},
     "enable_maker_checker_logic_enrollment": True,
     "enable_household_district_filter": False,
     "validation_enrollment": "validation-enrollment",
@@ -22,8 +31,18 @@ DEFAULT_CONFIG = {
     "registry_primary_worker_field": "primary_worker",
     "registry_household_verification_field": "validation_status",
     "registry_verified_household_value": "VERIFIED",
+    "registry_individual_verification_field": "validation_status",
+    "registry_verified_individual_value": "VERIFIED",
     "bulk_enrollment_batch_size": 1000,
+    # Location type whose name a derived district value reports, and the type
+    # the household district filter selects.
+    "district_location_type": "R",
     "max_enrolment_score": 100,
+    # Eligibility and ranking rules shared by a programme's Phases, keyed by
+    # BenefitPlan code.
+    "programme_profiles": {},
+    # Refuse to enrol into a Phase that matches no programme profile.
+    "require_programme_profile": False,
 }
 
 
@@ -31,7 +50,6 @@ class EnrolmentConfig(AppConfig):
     name = "enrolment"
     verbose_name = "Enrolment"
 
-    mandatory_enrollment_criteria = None
     enable_maker_checker_logic_enrollment = None
     enable_household_district_filter = False
     validation_enrollment = None
@@ -41,14 +59,19 @@ class EnrolmentConfig(AppConfig):
     registry_primary_worker_field = None
     registry_household_verification_field = None
     registry_verified_household_value = None
+    registry_individual_verification_field = None
+    registry_verified_individual_value = None
     bulk_enrollment_batch_size = None
+    district_location_type = None
     max_enrolment_score = None
+    programme_profiles = None
+    require_programme_profile = False
 
     def ready(self):
         from core.models import ModuleConfiguration
 
         config = ModuleConfiguration.get_or_default(self.name, DEFAULT_CONFIG)
-        self._validate_config(config)
+        self._validate_config(config, on_load=True)
         self._load_config(config)
         register_validator(self.name, self._validate_module_config)
         register_reloader(self.name, self._reload_module_config)
@@ -56,18 +79,27 @@ class EnrolmentConfig(AppConfig):
 
     @classmethod
     def _load_config(cls, config):
+        if _holds_mandatory_criteria(config):
+            logger.warning(RETIRED_MANDATORY_CRITERIA_MESSAGE)
         for field, value in {**DEFAULT_CONFIG, **config}.items():
             if hasattr(cls, field):
                 setattr(cls, field, value)
 
     @classmethod
-    def _validate_config(cls, config):
-        from enrolment.criteria import validate_mandatory_enrolment_criteria
+    def _validate_config(cls, config, on_load=False):
+        """Raise ValidationError for an invalid configuration.
 
-        validate_mandatory_enrolment_criteria(
-            config.get("mandatory_enrollment_criteria", {})
-        )
+        ``on_load`` is for a configuration that is already stored: retired
+        mandatory criteria are then left to the warning ``_load_config`` logs,
+        and values checked against other modules' data (location types and
+        district names) are only checked on save, since that data may not be
+        loaded yet at startup.
+        """
+        from enrolment.profiles import district_name_errors, validate_programme_profiles
+
         errors = []
+        if not on_load and _holds_mandatory_criteria(config):
+            errors.append(RETIRED_MANDATORY_CRITERIA_MESSAGE)
         for field in (
             "validation_enrollment",
             "validation_group_enrollment",
@@ -76,6 +108,9 @@ class EnrolmentConfig(AppConfig):
             "registry_primary_worker_field",
             "registry_household_verification_field",
             "registry_verified_household_value",
+            "registry_individual_verification_field",
+            "registry_verified_individual_value",
+            "district_location_type",
         ):
             if not isinstance(config.get(field), str) or not config[field].strip():
                 errors.append(f"{field} must be a non-empty string.")
@@ -83,6 +118,8 @@ class EnrolmentConfig(AppConfig):
             errors.append("enable_maker_checker_logic_enrollment must be boolean.")
         if not isinstance(config.get("enable_household_district_filter", False), bool):
             errors.append("enable_household_district_filter must be boolean.")
+        if not isinstance(config.get("require_programme_profile", False), bool):
+            errors.append("require_programme_profile must be boolean.")
         batch_size = config.get("bulk_enrollment_batch_size")
         if type(batch_size) is not int or batch_size < 1:
             errors.append("bulk_enrollment_batch_size must be a positive integer.")
@@ -94,6 +131,19 @@ class EnrolmentConfig(AppConfig):
             or max_score <= 0
         ):
             errors.append("max_enrolment_score must be a positive number.")
+        district_type = config.get("district_location_type")
+        if not on_load and isinstance(district_type, str) and district_type.strip():
+            from location.apps import LocationConfig
+
+            if district_type not in LocationConfig.location_types:
+                errors.append(
+                    f"district_location_type {district_type} is not a location type; "
+                    "location types: " + ", ".join(LocationConfig.location_types) + "."
+                )
+        profiles = config.get("programme_profiles", DEFAULT_CONFIG["programme_profiles"])
+        errors.extend(validate_programme_profiles(profiles))
+        if not on_load and not errors:
+            errors.extend(district_name_errors(profiles, district_type))
         if errors:
             raise ValidationError({"config": errors})
 
@@ -105,7 +155,7 @@ class EnrolmentConfig(AppConfig):
 
     def _reload_module_config(self, instance):
         config = self._merge_with_defaults(instance)
-        self._validate_config(config)
+        self._validate_config(config, on_load=True)
         self._load_config(config)
 
     @staticmethod
@@ -131,3 +181,20 @@ class EnrolmentConfig(AppConfig):
             "enrolment.ranking",
             benefit_plan_ranking_validation_errors,
         )
+
+
+def _holds_mandatory_criteria(config):
+    """Whether a configuration still sets retired mandatory enrolment criteria.
+
+    The empty shape older configurations carry ({"INDIVIDUAL": {}, "GROUP": {}})
+    is accepted, so they keep saving until the key is removed.
+    """
+    criteria = config.get(RETIRED_MANDATORY_CRITERIA_KEY)
+    if not criteria:
+        return False
+    if not isinstance(criteria, dict):
+        return True
+    return any(
+        not isinstance(statuses, dict) or any(statuses.values())
+        for statuses in criteria.values()
+    )

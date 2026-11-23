@@ -1,9 +1,9 @@
 from django.test import TestCase, override_settings
 
 from core.test_helpers import LogInHelper
-from enrolment.apps import EnrolmentConfig
 from enrolment.services import build_group_enrolment_selection, build_individual_enrolment_selection
-from individual.tests.test_helpers import create_group_with_individual, create_individual
+from enrolment.tests.helpers import create_verified_individual
+from individual.tests.test_helpers import create_group_with_individual
 from social_protection.tests.test_helpers import create_benefit_plan
 
 
@@ -14,13 +14,6 @@ class EnrolmentDataSourceTest(TestCase):
         super().setUpClass()
         cls.user = LogInHelper().get_or_create_user_api()
 
-    def setUp(self):
-        self.original_criteria = EnrolmentConfig.mandatory_enrollment_criteria
-        EnrolmentConfig.mandatory_enrollment_criteria = {"INDIVIDUAL": {}, "GROUP": {}}
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = self.original_criteria
-
     def _plan(self, plan_type, data_source=None):
         json_ext = {"advanced_criteria": {"ACTIVE": []}}
         if data_source:
@@ -29,7 +22,7 @@ class EnrolmentDataSourceTest(TestCase):
 
     def _individual(self, data_source=None):
         json_ext = {"data_source": data_source} if data_source else {}
-        return create_individual(self.user.username, payload_override={"json_ext": json_ext})
+        return create_verified_individual(self.user.username, payload_override={"json_ext": json_ext})
 
     def _verified_group(self, data_source=None):
         _, group, membership = create_group_with_individual(self.user.username)

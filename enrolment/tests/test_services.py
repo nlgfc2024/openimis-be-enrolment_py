@@ -1,9 +1,9 @@
 from django.test import TestCase, override_settings
 
 from core.test_helpers import LogInHelper
-from enrolment.apps import EnrolmentConfig
 from enrolment.services import build_individual_enrolment_selection
-from individual.tests.test_helpers import create_group_with_individual, create_individual
+from enrolment.tests.helpers import create_verified_individual
+from individual.tests.test_helpers import create_group_with_individual
 from social_protection.tests.test_helpers import create_benefit_plan
 
 
@@ -14,23 +14,16 @@ class IndividualEnrolmentSelectionTest(TestCase):
         super().setUpClass()
         cls.user = LogInHelper().get_or_create_user_api()
 
-    def setUp(self):
-        self.original_criteria = EnrolmentConfig.mandatory_enrollment_criteria
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {},
-        }
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = self.original_criteria
-
     def test_deleted_group_releases_individual_for_enrolment(self):
         benefit_plan = create_benefit_plan(self.user.username, payload_override={
             'type': 'INDIVIDUAL',
             'json_ext': {'advanced_criteria': {'ACTIVE': []}},
         })
-        _, group, group_individual = create_group_with_individual(self.user.username)
-        create_individual(self.user.username)
+        _, group, group_individual = create_group_with_individual(
+            self.user.username,
+            individual_override={'json_ext': {'validation_status': 'VERIFIED'}},
+        )
+        create_verified_individual(self.user.username)
 
         selection = build_individual_enrolment_selection(
             [], str(benefit_plan.id), 'ACTIVE', self.user,

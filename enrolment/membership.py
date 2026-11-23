@@ -13,6 +13,15 @@ def active_household_memberships():
     )
 
 
+def household_head_memberships():
+    """Return active memberships whose role is household head."""
+    from individual.models import GroupIndividual
+
+    return active_household_memberships().filter(
+        role=GroupIndividual.Role.HEAD
+    )
+
+
 def authoritative_primary_worker_memberships():
     """Return active primary workers belonging to verified households."""
     primary_worker_lookup = (
@@ -27,6 +36,32 @@ def authoritative_primary_worker_memberships():
             verification_lookup: EnrolmentConfig.registry_verified_household_value,
         }
     )
+
+
+# Subject names shared by profile criteria, order_by items and quota
+# conditions. household and self name the candidate record itself.
+SELF_SUBJECT = "self"
+HOUSEHOLD_SUBJECT = "household"
+HEAD_SUBJECT = "head"
+PRIMARY_WORKER_SUBJECT = "primary_worker"
+ANY_MEMBER_SUBJECT = "any_member"
+# The subject that names the candidate record, by Phase type.
+CANDIDATE_SUBJECTS = {"GROUP": HOUSEHOLD_SUBJECT, "INDIVIDUAL": SELF_SUBJECT}
+# Household members a GROUP subject reads, with the memberships that hold them.
+MEMBER_SUBJECTS = {
+    PRIMARY_WORKER_SUBJECT: authoritative_primary_worker_memberships,
+    HEAD_SUBJECT: household_head_memberships,
+    ANY_MEMBER_SUBJECT: active_household_memberships,
+}
+
+
+def verified_individual_filter():
+    """Build the filter for individuals the registry marks as verified."""
+    return Q(**{
+        f"json_ext__{EnrolmentConfig.registry_individual_verification_field}": (
+            EnrolmentConfig.registry_verified_individual_value
+        ),
+    })
 
 
 def primary_worker_membership_filter(prefix="groupindividuals"):

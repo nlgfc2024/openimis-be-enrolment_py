@@ -1,4 +1,3 @@
-import copy
 from types import SimpleNamespace
 
 from django.contrib.auth.models import AnonymousUser
@@ -15,12 +14,11 @@ from enrolment.services import (
     build_individual_enrolment_selection,
     build_individual_enrolment_summary,
 )
-from enrolment.apps import EnrolmentConfig
+from enrolment.tests.helpers import create_verified_individual
 from individual.models import Group, Individual
 from individual.tests.test_helpers import (
     IndividualGQLTestCase,
     create_group,
-    create_individual,
     add_individual_to_group,
 )
 from social_protection.tests.test_helpers import create_benefit_plan
@@ -72,10 +70,10 @@ class EnrolmentRowSecurityTest(IndividualGQLTestCase):
                 "json_ext": {"advanced_criteria": {"ACTIVE": []}},
             },
         )
-        cls.individual_a = create_individual(
+        cls.individual_a = create_verified_individual(
             cls.admin_user.username, {"location": cls.village_a}
         )
-        cls.individual_b = create_individual(
+        cls.individual_b = create_verified_individual(
             cls.admin_user.username, {"location": cls.village_b}
         )
         cls.group_a = create_group(
@@ -87,7 +85,7 @@ class EnrolmentRowSecurityTest(IndividualGQLTestCase):
             {"location": cls.village_b, "json_ext": {"validation_status": "VERIFIED"}},
         )
         for group in (cls.group_a, cls.group_b):
-            individual = create_individual(
+            individual = create_verified_individual(
                 cls.admin_user.username, {"location": group.location}
             )
             membership = add_individual_to_group(
@@ -101,20 +99,6 @@ class EnrolmentRowSecurityTest(IndividualGQLTestCase):
                 "validation_status": "VERIFIED",
             }
             group.save(username=cls.admin_user.username)
-
-    def setUp(self):
-        self.original_mandatory_criteria = copy.deepcopy(
-            EnrolmentConfig.mandatory_enrollment_criteria
-        )
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {},
-        }
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = (
-            self.original_mandatory_criteria
-        )
 
     def test_individual_preview_summary_ranking_and_confirmation_are_scoped(self):
         selection = build_individual_enrolment_selection(

@@ -1,4 +1,5 @@
-import copy
+from datetime import date, timedelta
+
 from django.core.exceptions import ValidationError
 from unittest.mock import patch
 
@@ -10,13 +11,13 @@ from enrolment.services import (
     build_individual_enrolment_selection,
 )
 from enrolment.schema import Mutation as EnrolmentMutation, Query as EnrolmentQuery
+from enrolment.tests.helpers import ProfileRankingMixin, create_verified_individual
 from individual.models import IndividualDataSource
 from individual.schema import Mutation as IndividualMutation, Query as IndividualQuery
 from individual.tests.test_helpers import (
     BaseTestContext,
     IndividualGQLTestCase,
     create_group_with_individual,
-    create_individual,
 )
 from social_protection.models import (
     Beneficiary,
@@ -29,21 +30,7 @@ from tasks_management.services import TaskService
 from openIMIS.schema import schema as assembled_schema
 
 
-class EnrolmentConfirmationTest(IndividualGQLTestCase):
-    def setUp(self):
-        self.original_mandatory_criteria = copy.deepcopy(
-            EnrolmentConfig.mandatory_enrollment_criteria
-        )
-        EnrolmentConfig.mandatory_enrollment_criteria = {
-            "INDIVIDUAL": {},
-            "GROUP": {},
-        }
-
-    def tearDown(self):
-        EnrolmentConfig.mandatory_enrollment_criteria = (
-            self.original_mandatory_criteria
-        )
-
+class EnrolmentConfirmationTest(ProfileRankingMixin, IndividualGQLTestCase):
     def _plan(self, plan_type, token):
         return create_benefit_plan(
             self.admin_user.username,
@@ -65,7 +52,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
             },
         )
 
-    def _verified_group(self, token):
+    def _verified_group(self, token, individual_json_ext=None):
         individual, group, membership = create_group_with_individual(
             self.admin_user.username,
             group_override={
@@ -74,7 +61,10 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
                     "validation_status": "VERIFIED",
                 }
             },
-            individual_override={"json_ext": {"enrolment_test": token}},
+            individual_override={"json_ext": {
+                "enrolment_test": token,
+                **(individual_json_ext or {}),
+            }},
         )
         membership.json_ext = {"primary_worker": True}
         membership.save(username=self.admin_user.username)
@@ -88,7 +78,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
         return individual, group, membership
 
     def _percentage_plan(self, plan_type, token):
-        return create_benefit_plan(
+        return self._ranked_plan(
             self.admin_user.username,
             payload_override={
                 "type": plan_type,
@@ -123,7 +113,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_direct_individual_confirmation_persists_once(self):
         plan = self._plan("INDIVIDUAL", "direct-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "direct-individual"}},
         )
@@ -174,7 +164,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_individual_maker_checker_stages_one_pending_workflow(self):
         plan = self._plan("INDIVIDUAL", "maker-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "maker-individual"}},
         )
@@ -250,7 +240,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_approved_individual_workflow_persists_beneficiary(self, _synchronize):
         plan = self._plan("INDIVIDUAL", "approved-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "approved-individual"}},
         )
@@ -293,7 +283,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
         token = "percentage-individual"
         plan = self._percentage_plan("INDIVIDUAL", token)
         for _ in range(10):
-            create_individual(
+            create_verified_individual(
                 self.admin_user.username,
                 {"json_ext": {"enrolment_test": token}},
             )
@@ -346,7 +336,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_approval_failure_rolls_back_beneficiary_and_fails_task(self, _sync):
         plan = self._plan("INDIVIDUAL", "rollback-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "rollback-individual"}},
         )
@@ -375,7 +365,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_approval_rejects_candidate_enrolled_while_pending(self):
         plan = self._plan("INDIVIDUAL", "duplicate-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "duplicate-individual"}},
         )
@@ -409,7 +399,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_approval_rejects_candidate_that_becomes_ineligible(self):
         plan = self._plan("INDIVIDUAL", "eligible-while-staged")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "eligible-while-staged"}},
         )
@@ -439,9 +429,65 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     @patch.object(
         EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
     )
+    @patch(
+        "enrolment.confirmation.BeneficiaryImportService."
+        "synchronize_data_for_reporting"
+    )
+    def test_approval_checks_ages_on_the_day_of_submission(self, _synchronize):
+        token = "age-at-submission"
+        plan = self._plan("INDIVIDUAL", token)
+        EnrolmentConfig.programme_profiles = {plan.code: {"eligibility": {"criteria": [
+            {"derived": "age", "filter": "lte", "value": 60},
+        ]}}}
+        today = date.today()
+        birthday = today + timedelta(days=5)
+        try:
+            dob = birthday.replace(year=birthday.year - 61)
+        except ValueError:
+            dob = birthday.replace(year=birthday.year - 61, day=28)
+        # 60 when submitted, 61 by the time the enrolment is approved.
+        individual = create_verified_individual(
+            self.admin_user.username,
+            {"dob": dob, "json_ext": {"enrolment_test": token}},
+        )
+        EnrolmentService(self.admin_user).select_individuals_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+
+        class TenDaysLater(date):
+            @classmethod
+            def today(cls):
+                return today + timedelta(days=10)
+
+        with patch("enrolment.ranking.date", TenDaysLater):
+            # A new submission on the approval day would leave them out ...
+            later = build_individual_enrolment_selection(
+                [], str(plan.id), "ACTIVE", self.admin_user
+            )
+            self.assertFalse(
+                later["individual_query_with_filters"].filter(id=individual.id).exists()
+            )
+            # ... but approval keeps them, as they qualified when submitted.
+            TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertTrue(
+            Beneficiary.objects.filter(
+                individual=individual, benefit_plan=plan, is_deleted=False
+            ).exists()
+        )
+
+    @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
     def test_approval_rechecks_remaining_capacity_under_plan_lock(self):
         token = "approval-capacity"
-        plan = create_benefit_plan(
+        plan = self._ranked_plan(
             self.admin_user.username,
             payload_override={
                 "type": "INDIVIDUAL",
@@ -463,7 +509,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
                 },
             },
         )
-        staged = create_individual(
+        staged = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": token}},
         )
@@ -474,7 +520,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
             benefit_plan=plan, workflow="Enrollment", is_deleted=False
         )
         task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
-        other = create_individual(self.admin_user.username)
+        other = create_verified_individual(self.admin_user.username)
         Beneficiary(
             individual=other,
             benefit_plan=plan,
@@ -572,11 +618,97 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
         )
 
     @patch.object(
+        EnrolmentConfig, "enable_maker_checker_logic_enrollment", True
+    )
+    def test_approval_keeps_places_filled_after_a_quota_shortfall(self):
+        token = "quota-shortfall-group"
+        plan = self._ranked_plan(
+            self.admin_user.username,
+            payload_override={
+                "type": "GROUP",
+                "max_beneficiaries": 4,
+                "beneficiary_data_schema": {
+                    "properties": {"enrolment_test": {"type": "string"}}
+                },
+                "json_ext": {
+                    "advanced_criteria": {
+                        "ACTIVE": [{
+                            "field": "enrolment_test",
+                            "filter": "exact",
+                            "type": "string",
+                            "value": token,
+                        }]
+                    },
+                    "enrolment_ranking": {
+                        "ACTIVE": {
+                            "order_by": ["id"],
+                            "selection_strategy": {
+                                "source": "PRIMARY_WORKER",
+                                "quotas": [{
+                                    "key": "female",
+                                    "percentage": 50,
+                                    "when": [{
+                                        "field": "gender",
+                                        "filter": "iexact",
+                                        "type": "string",
+                                        "value": "Female",
+                                    }],
+                                }],
+                            },
+                        }
+                    },
+                },
+            },
+        )
+        men = [
+            self._verified_group(token, {"gender": "Male"})[1]
+            for _ in range(4)
+        ]
+        _, woman, _ = self._verified_group(token, {"gender": "Female"})
+        # The female quota reserves 2 of the 4 places but has one candidate,
+        # so the spare place goes to the next ranked household. The last
+        # man misses out even though he ranks ahead of the woman by id.
+        expected = {woman.id, men[0].id, men[1].id, men[2].id}
+
+        preview = build_group_enrolment_selection(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        self.assertEqual(preview["will_enrol"], 4)
+        self.assertEqual(
+            set(
+                preview["groups_not_assigned_to_selected_programme"]
+                .values_list("id", flat=True)
+            ),
+            expected,
+        )
+
+        EnrolmentService(self.admin_user).select_groups_to_benefit_plan(
+            [], str(plan.id), "ACTIVE", self.admin_user
+        )
+        record = BenefitPlanDataUploadRecords.objects.get(
+            benefit_plan=plan, workflow="Enrollment", is_deleted=False
+        )
+        task = Task.objects.get(entity_id=str(record.id), is_deleted=False)
+
+        TaskService(self.admin_user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertEqual(
+            set(
+                GroupBeneficiary.objects.filter(
+                    benefit_plan=plan, status="ACTIVE", is_deleted=False
+                ).values_list("group_id", flat=True)
+            ),
+            expected,
+        )
+
+    @patch.object(
         EnrolmentConfig, "enable_maker_checker_logic_enrollment", False
     )
     def test_new_graphql_mutation_confirms_individual_enrolment(self):
         plan = self._plan("INDIVIDUAL", "graphql-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "graphql-individual"}},
         )
@@ -635,7 +767,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
     )
     def test_graphql_individual_confirmation_starts_approval_workflow(self):
         plan = self._plan("INDIVIDUAL", "graphql-maker-individual")
-        individual = create_individual(
+        individual = create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "graphql-maker-individual"}},
         )
@@ -739,7 +871,7 @@ class EnrolmentConfirmationTest(IndividualGQLTestCase):
             "message": "workflow unavailable",
         }
         plan = self._plan("INDIVIDUAL", "maker-failure")
-        create_individual(
+        create_verified_individual(
             self.admin_user.username,
             {"json_ext": {"enrolment_test": "maker-failure"}},
         )

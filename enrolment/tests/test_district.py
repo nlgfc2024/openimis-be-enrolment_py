@@ -5,13 +5,14 @@ from django.core.exceptions import PermissionDenied, ValidationError
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 
 from enrolment.apps import EnrolmentConfig, DEFAULT_CONFIG
-from enrolment.district import district_from_condition
+from enrolment.district import district_from_condition, district_name
 from enrolment.criteria import validate_operator_filters as _validate_operator_filters
 
 from core.test_helpers import LogInHelper, create_test_interactive_user, create_test_language
-from individual.models import Group
+from individual.models import Group, Individual
 from enrolment.services import build_group_enrollment_queryset
-from individual.tests.test_helpers import create_group, create_sp_role
+from enrolment.tests.helpers import ProfileRankingMixin
+from individual.tests.test_helpers import create_group, create_individual, create_sp_role
 from location.models import Location, UserDistrict, cache, free_cache_for_user
 from social_protection.tests.test_helpers import create_benefit_plan
 
@@ -77,9 +78,39 @@ class DistrictFilterContractTest(SimpleTestCase):
                     _validate_operator_filters([condition], plan)
 
 
+class DistrictNameTest(TestCase):
+    def test_district_name_is_the_nearest_district_location(self):
+        def location(kind, code, parent=None):
+            return Location.objects.create(
+                type=kind, code=code, name=code, parent=parent, audit_user_id=-1,
+            )
+
+        district = location("R", "DN-ZOMBA")
+        village = location(
+            "V", "DN-V", location("W", "DN-W", location("D", "DN-D", district)),
+        )
+        user = LogInHelper().get_or_create_user_api()
+        in_village = create_individual(user.username, {"location": village})
+        at_district = create_individual(user.username, {"location": district})
+        nowhere = create_individual(user.username, {"location": None})
+
+        names = dict(
+            Individual.objects.filter(
+                id__in=[in_village.id, at_district.id, nowhere.id]
+            ).annotate(_district=district_name()).values_list("id", "_district")
+        )
+
+        self.assertEqual(names, {
+            in_village.id: "DN-ZOMBA",
+            at_district.id: "DN-ZOMBA",
+            nowhere.id: None,
+        })
+
+
 @override_settings(ROW_SECURITY=True)
-class DistrictEnrollmentQueryTest(TestCase):
+class DistrictEnrollmentQueryTest(ProfileRankingMixin, TestCase):
     def setUp(self):
+        super().setUp()
         flag = patch.object(EnrolmentConfig, "enable_household_district_filter", True)
         flag.start()
         self.addCleanup(flag.stop)
@@ -226,8 +257,10 @@ class DistrictEnrollmentQueryTest(TestCase):
         from social_protection.models import GroupBeneficiary
         from enrolment.services import build_group_enrollment_selection
         self.plan.max_beneficiaries = 1
-        self.plan.json_ext["enrolment_ranking"] = {"ACTIVE": {"order_by": ["id"], "limit": {"percentage": 100}}}
         self.plan.save(username=self.admin.username)
+        EnrolmentConfig.programme_profiles = {self.plan.code: {"ranking": {
+            "ACTIVE": {"order_by": ["id"], "limit": {"percentage": 100}},
+        }}}
         GroupBeneficiary(group=self.other, benefit_plan=self.plan, status="ACTIVE").save(username=self.admin.username)
         selected = build_group_enrollment_selection(self.conditions(self.a), str(self.plan.id), "ACTIVE", self.user)
         self.assertEqual(selected["pool_size"], 1)
@@ -318,10 +351,10 @@ class DistrictEnrollmentQueryTest(TestCase):
     def test_verified_pool_is_before_cap_and_target_is_not_remaining_capacity(self):
         from social_protection.models import GroupBeneficiary
         self.plan.max_beneficiaries = 1
-        self.plan.json_ext['enrolment_ranking'] = {
-            'ACTIVE': {'order_by': ['id'], 'limit': {'percentage': 100}},
-        }
         self.plan.save(username=self.admin.username)
+        EnrolmentConfig.programme_profiles = {self.plan.code: {'ranking': {
+            'ACTIVE': {'order_by': ['id'], 'limit': {'percentage': 100}},
+        }}}
         GroupBeneficiary(group=self.other, benefit_plan=self.plan, status='ACTIVE').save(
             username=self.admin.username)
         self.assertEqual(self.summary(self.a), {

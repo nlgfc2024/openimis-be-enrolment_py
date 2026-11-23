@@ -3,6 +3,7 @@ import logging
 from core.models import User
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.utils import timezone
 
 from individual.models import Individual, IndividualDataSource
 from social_protection.models import (
@@ -22,6 +23,8 @@ from enrolment.persistence import (
     EnrollmentPersistenceService,
     calculate_percentage_of_invalid_items,
 )
+from enrolment.profiles import profile_as_submitted, profile_snapshot
+from enrolment.ranking import ages_on
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ def _start_approval_workflow(
     business_event,
     label,
     custom_filters,
+    benefit_plan,
 ):
     task_result = TaskService(user).create({
         "source": "import_valid_items",
@@ -72,6 +76,7 @@ def _start_approval_workflow(
             "benefit_plan_id": str(upload_record.benefit_plan_id),
             "beneficiary_status": status,
             "custom_filters": list(custom_filters or []),
+            "programme_profile": profile_snapshot(benefit_plan),
         },
     })
     if not task_result or not task_result.get("success"):
@@ -119,6 +124,7 @@ def confirm_individual_enrolment(custom_filters, benefit_plan_id, status, user):
             business_event,
             "individual",
             custom_filters,
+            benefit_plan,
         )
         result["confirmation"] = {
             "mode": "maker_checker",
@@ -171,6 +177,7 @@ def confirm_group_enrolment(custom_filters, benefit_plan_id, status, user):
             business_event,
             "group",
             custom_filters,
+            benefit_plan,
         )
         result["confirmation"] = {
             "mode": "maker_checker",
@@ -313,6 +320,18 @@ def _complete_group_approval(user, benefit_plan, upload_id, status, custom_filte
     )
 
 
+def _submission_date(upload_record):
+    """Return the day an enrolment was submitted for approval.
+
+    The staged upload record is created in the same transaction as the
+    submission, including for tasks submitted before this was recorded.
+    """
+    submitted = upload_record.date_created
+    if timezone.is_aware(submitted):
+        submitted = timezone.localtime(submitted)
+    return submitted.date()
+
+
 @transaction.atomic
 def on_task_complete_enrolment(**kwargs):
     """Complete an approved enrollment task inside the Enrolment module."""
@@ -345,8 +364,11 @@ def on_task_complete_enrolment(**kwargs):
 
         # The nested atomic block creates a savepoint. Catching below can mark
         # the workflow failed without committing beneficiaries written before a
-        # later reporting or persistence error.
-        with transaction.atomic():
+        # later reporting or persistence error. Ages and the programme profile
+        # are re-checked as they were when the enrolment was submitted, so an
+        # approval delay or a profile edit meanwhile does not change the rules.
+        with transaction.atomic(), ages_on(_submission_date(upload_record)), \
+                profile_as_submitted(task_data.get("programme_profile")):
             benefit_plan = BenefitPlan.objects.select_for_update().get(
                 id=task_data["benefit_plan_id"]
             )

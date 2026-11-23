@@ -1,5 +1,7 @@
 import json
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, timedelta
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
@@ -12,16 +14,35 @@ from django.db.models import (
     F,
     FloatField,
     IntegerField,
+    Max,
     OuterRef,
+    Q,
     Subquery,
     Value,
     When,
 )
 from django.db.models.fields.json import KeyTextTransform
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Coalesce
 
+from core.custom_filters import CustomFilterWizardStorage
 from enrolment.apps import EnrolmentConfig
-from enrolment.membership import authoritative_primary_worker_memberships
+from enrolment.criteria import (
+    FILTERS_BY_TYPE,
+    VALUE_TYPES,
+    criterion_to_condition,
+    is_number,
+    is_one_of,
+)
+from enrolment.district import district_name, in_district
+from enrolment.membership import (
+    ANY_MEMBER_SUBJECT,
+    CANDIDATE_SUBJECTS,
+    HEAD_SUBJECT,
+    HOUSEHOLD_SUBJECT,
+    MEMBER_SUBJECTS,
+    PRIMARY_WORKER_SUBJECT,
+    SELF_SUBJECT,
+)
 
 
 SUPPORTED_CASTS = {
@@ -33,33 +54,50 @@ SUPPORTED_CASTS = {
 SUPPORTED_DIRECTIONS = {"asc", "desc"}
 SUPPORTED_NULLS = {"first", "last"}
 WEIGHTED_SCORE_FIELD = "_weighted_score"
+# Scores are floats built from weight / maximum-points ratios, so a candidate
+# exactly at the minimum can compute a hair below it.
+SCORE_TOLERANCE = 1e-9
+# Rankings come from programme profiles only; a Phase can no longer hold one.
+RETIRED_PHASE_RANKING_MESSAGE = (
+    "Set the ranking in the programme profile instead "
+    "(programme_profiles.<Phase code or default>.ranking in the enrolment "
+    "module configuration) and remove enrolment_ranking from the Phase."
+)
 PRIMARY_WORKER_SOURCE = "PRIMARY_WORKER"
 HOUSEHOLD_HEAD_SOURCE = "HOUSEHOLD_HEAD"
 SELF_SOURCE = "SELF"
+# The subject each selection_strategy.source names.
+SOURCE_SUBJECTS = {
+    SELF_SOURCE: SELF_SUBJECT,
+    PRIMARY_WORKER_SOURCE: PRIMARY_WORKER_SUBJECT,
+    HOUSEHOLD_HEAD_SOURCE: HEAD_SUBJECT,
+}
+# Household members whose json_ext a GROUP order_by item may read. A sort needs
+# one value per household, so any_member waits for a best-member aggregate.
+ORDER_BY_MEMBER_SUBJECTS = {HEAD_SUBJECT, PRIMARY_WORKER_SUBJECT}
+COMPONENT_KEYS = {"label", "field", "derived", "subject", "aggregate", "weight", "scoring"}
+# Derived values a score component may read instead of a json_ext field, with
+# the scoring type each needs: age in whole years, district by name.
+DERIVED_SCORE_VALUES = {"age": "numeric_bands", "district": "mapping"}
+# How the points of several household members combine into one score item.
+COMPONENT_AGGREGATES = {"max"}
+SHORTHAND_QUOTA_KEYS = {
+    "female_percentage",
+    "youth_percentage",
+    "female_value",
+    "youth_min_age",
+    "youth_max_age",
+}
 
 
-def load_ranking_spec(benefit_plan, status):
-    """Return the status-specific ranking configuration stored on a Phase."""
-    json_ext = benefit_plan.json_ext or {}
+def holds_phase_ranking(json_ext):
+    """Whether a Phase's json_ext still sets the retired enrolment_ranking."""
     if isinstance(json_ext, str):
         try:
             json_ext = json.loads(json_ext)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("BenefitPlan json_ext must be valid JSON.") from exc
-    if not isinstance(json_ext, dict):
-        raise ValidationError("BenefitPlan json_ext must be an object.")
-
-    rankings = json_ext.get("enrolment_ranking")
-    if rankings is None:
-        return None
-    if not isinstance(rankings, dict):
-        raise ValidationError("enrolment_ranking must be an object keyed by beneficiary status.")
-    ranking = rankings.get(status, rankings.get("*"))
-    if ranking is None:
-        return None
-    if not isinstance(ranking, dict):
-        raise ValidationError(f"enrolment_ranking.{status} must be an object.")
-    return ranking
+        except (TypeError, ValueError):
+            return False
+    return isinstance(json_ext, dict) and bool(json_ext.get("enrolment_ranking"))
 
 
 def _validate_model_path(model, path, extra_fields=None, schema_fields=None):
@@ -94,7 +132,9 @@ def _normalise_order_item(
         field = item[1:] if item.startswith("-") else item
         result = {"field": field, "direction": direction}
     elif isinstance(item, dict):
-        unexpected = set(item) - {"field", "direction", "cast", "nulls"}
+        unexpected = set(item) - {
+            "subject", "field", "direction", "cast", "nulls",
+        }
         if unexpected:
             raise ValidationError(
                 f"Unsupported enrolment_ranking.order_by[{index}] keys: "
@@ -105,32 +145,63 @@ def _normalise_order_item(
     else:
         raise ValidationError(f"enrolment_ranking.order_by[{index}] must be a string or object.")
 
-    _validate_model_path(
-        model,
-        result.get("field"),
-        extra_fields,
-        schema_fields,
-    )
-    if result["direction"] not in SUPPORTED_DIRECTIONS:
+    subject = result.pop("subject", None)
+    if model._meta.model_name == "individual":
+        if not is_one_of(subject, {None, SELF_SUBJECT}):
+            raise ValidationError(
+                f"INDIVIDUAL enrolment_ranking.order_by[{index}].subject "
+                "must be self."
+            )
+        subject = None
+    elif subject is not None and not is_one_of(subject, ORDER_BY_MEMBER_SUBJECTS):
+        raise ValidationError(
+            f"GROUP enrolment_ranking.order_by[{index}].subject must be "
+            "head or primary_worker."
+        )
+
+    if subject is None:
+        _validate_model_path(
+            model,
+            result.get("field"),
+            extra_fields,
+            schema_fields,
+        )
+    else:
+        # Member values come from Individual.json_ext, which the Phase's
+        # beneficiary_data_schema does not describe.
+        field = result.get("field")
+        if not isinstance(field, str) or not field or "__" in field:
+            raise ValidationError(
+                f"enrolment_ranking.order_by[{index}].field must be a json_ext "
+                f"key on the {subject}."
+            )
+        result["subject"] = subject
+    if not is_one_of(result["direction"], SUPPORTED_DIRECTIONS):
         raise ValidationError(f"Unsupported ranking direction: {result['direction']}.")
-    if result.get("cast") not in ({None} | set(SUPPORTED_CASTS)):
+    if not is_one_of(result.get("cast"), {None} | set(SUPPORTED_CASTS)):
         raise ValidationError(f"Unsupported ranking cast: {result.get('cast')}.")
-    if result.get("nulls") not in ({None} | SUPPORTED_NULLS):
+    if not is_one_of(result.get("nulls"), {None} | SUPPORTED_NULLS):
         raise ValidationError(f"Unsupported ranking null placement: {result.get('nulls')}.")
     return result
 
 
-def _is_number(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
-
-
 def _positive_number(value, path):
-    if not _is_number(value) or value <= 0:
+    if not is_number(value) or value <= 0:
         raise ValidationError(f"{path} must be a positive number.")
+
+
+def _validate_minimum_score(minimum_score, weighted_score):
+    if minimum_score is None:
+        return
+    if weighted_score is None:
+        raise ValidationError("enrolment_ranking.minimum_score requires weighted_score.")
+    _positive_number(minimum_score, "enrolment_ranking.minimum_score")
+    highest = weighted_score.get("normalise_to", 100)
+    if minimum_score > highest:
+        raise ValidationError(
+            f"enrolment_ranking.minimum_score cannot exceed {highest:g}, the "
+            "highest score weighted_score.normalise_to allows."
+        )
 
 
 def _validate_score_source(score_source, model):
@@ -174,13 +245,13 @@ def _validate_scoring(scoring, path):
         if not isinstance(values, dict) or not values:
             raise ValidationError(f"{path}.values must be a non-empty object.")
         if not all(
-            isinstance(key, str) and _is_number(points)
+            isinstance(key, str) and is_number(points)
             for key, points in values.items()
         ):
             raise ValidationError(
                 f"{path}.values must map strings to numeric points."
             )
-        if not _is_number(scoring.get("default", 0)):
+        if not is_number(scoring.get("default", 0)):
             raise ValidationError(f"{path}.default must be numeric.")
         maximum_points = scoring.get(
             "maximum_points",
@@ -209,14 +280,14 @@ def _validate_scoring(scoring, path):
                     f"Unsupported {band_path} keys: "
                     f"{', '.join(sorted(unexpected_band))}."
                 )
-            if "points" not in band or not _is_number(band["points"]):
+            if "points" not in band or not is_number(band["points"]):
                 raise ValidationError(f"{band_path}.points must be numeric.")
             if "min" not in band and "max" not in band:
                 raise ValidationError(
                     f"{band_path} must define min, max, or both."
                 )
             for bound in ("min", "max"):
-                if bound in band and not _is_number(band[bound]):
+                if bound in band and not is_number(band[bound]):
                     raise ValidationError(f"{band_path}.{bound} must be numeric.")
             if (
                 "min" in band
@@ -225,7 +296,7 @@ def _validate_scoring(scoring, path):
             ):
                 raise ValidationError(f"{band_path}.min cannot exceed max.")
             points.append(band["points"])
-        if not _is_number(scoring.get("default", 0)):
+        if not is_number(scoring.get("default", 0)):
             raise ValidationError(f"{path}.default must be numeric.")
         maximum_points = scoring.get(
             "maximum_points",
@@ -245,7 +316,84 @@ def _validate_scoring(scoring, path):
         )
 
 
-def _validate_weighted_score(weighted_score):
+def _phase_type(model):
+    return "GROUP" if model._meta.model_name == "group" else "INDIVIDUAL"
+
+
+def _component_subject(component, model, score_source):
+    """Return whose value a score component reads.
+
+    Without a ``subject``, a component reads the plan-level ``score_source``
+    (the primary worker) when one is set, and otherwise the candidate itself.
+    """
+    if component.get("subject"):
+        return component["subject"]
+    if score_source:
+        return PRIMARY_WORKER_SUBJECT
+    return CANDIDATE_SUBJECTS[_phase_type(model)]
+
+
+def _component_name(component):
+    """Name a score component in messages: its label, or subject and field."""
+    if component.get("label"):
+        return component["label"]
+    name = component.get("field") or component.get("derived")
+    return f"{component['subject']}.{name}" if component.get("subject") else name
+
+
+def _validate_component_source(component, path, model):
+    phase_type = _phase_type(model)
+    subjects = {CANDIDATE_SUBJECTS[phase_type]}
+    if phase_type == "GROUP":
+        subjects |= set(MEMBER_SUBJECTS)
+    subject = component.get("subject")
+    if subject is not None and not is_one_of(subject, subjects):
+        raise ValidationError(
+            f"{phase_type} {path}.subject must be one of "
+            + ", ".join(sorted(subjects)) + "."
+        )
+    aggregate = component.get("aggregate")
+    if subject == ANY_MEMBER_SUBJECT:
+        if not is_one_of(aggregate, COMPONENT_AGGREGATES):
+            raise ValidationError(
+                f"{path}.aggregate must be one of "
+                + ", ".join(sorted(COMPONENT_AGGREGATES))
+                + " when subject is any_member."
+            )
+    elif aggregate is not None:
+        raise ValidationError(f"{path}.aggregate is only used with subject any_member.")
+    label = component.get("label")
+    if label is not None and (not isinstance(label, str) or not label.strip()):
+        raise ValidationError(f"{path}.label must be a non-empty string.")
+
+
+def _validate_derived_component(component, path, subject):
+    derived = component["derived"]
+    if not is_one_of(derived, DERIVED_SCORE_VALUES):
+        raise ValidationError(
+            f"{path}.derived {derived} is not supported; supported values: "
+            + ", ".join(sorted(DERIVED_SCORE_VALUES)) + "."
+        )
+    scoring = component.get("scoring")
+    scoring_type = DERIVED_SCORE_VALUES[derived]
+    if isinstance(scoring, dict) and scoring.get("type") != scoring_type:
+        raise ValidationError(f"{path}.scoring.type must be {scoring_type} for {derived}.")
+    if derived == "age":
+        if subject == HOUSEHOLD_SUBJECT:
+            raise ValidationError(
+                f"{path}.derived age needs a person: set subject to head, "
+                "primary_worker or any_member."
+            )
+        for index, band in enumerate((scoring or {}).get("bands") or []):
+            for bound in ("min", "max"):
+                if bound in band and type(band[bound]) is not int:
+                    raise ValidationError(
+                        f"{path}.scoring.bands[{index}].{bound} must be a whole "
+                        "number of years."
+                    )
+
+
+def _validate_weighted_score(weighted_score, model, score_source=None):
     if not isinstance(weighted_score, dict):
         raise ValidationError("enrolment_ranking.weighted_score must be an object.")
     unexpected = set(weighted_score) - {"normalise_to", "components"}
@@ -270,23 +418,33 @@ def _validate_weighted_score(weighted_score):
         raise ValidationError(
             "enrolment_ranking.weighted_score.components must be a non-empty list."
         )
-    fields = set()
+    sources = set()
     for index, component in enumerate(components):
         path = f"enrolment_ranking.weighted_score.components[{index}]"
         if not isinstance(component, dict):
             raise ValidationError(f"{path} must be an object.")
-        unexpected_component = set(component) - {"field", "weight", "scoring"}
+        unexpected_component = set(component) - COMPONENT_KEYS
         if unexpected_component:
             raise ValidationError(
                 f"Unsupported {path} keys: "
                 f"{', '.join(sorted(unexpected_component))}."
             )
-        field = component.get("field")
-        if not isinstance(field, str) or not field:
-            raise ValidationError(f"{path}.field must be a non-empty string.")
-        if field in fields:
-            raise ValidationError(f"Duplicate weighted score field: {field}.")
-        fields.add(field)
+        _validate_component_source(component, path, model)
+        subject = _component_subject(component, model, score_source)
+        if ("field" in component) == ("derived" in component):
+            raise ValidationError(f"{path} must set exactly one of field or derived.")
+        if "derived" in component:
+            _validate_derived_component(component, path, subject)
+        else:
+            field = component["field"]
+            if not isinstance(field, str) or not field:
+                raise ValidationError(f"{path}.field must be a non-empty string.")
+        source = (subject, component.get("field") or component["derived"])
+        if source in sources:
+            raise ValidationError(
+                f"Duplicate weighted score field: {_component_name(component)}."
+            )
+        sources.add(source)
         _positive_number(component.get("weight"), f"{path}.weight")
         _validate_scoring(component.get("scoring"), f"{path}.scoring")
     total_points = sum(
@@ -305,14 +463,7 @@ def _normalise_selection_strategy(selection_strategy, model):
         raise ValidationError(
             "enrolment_ranking.selection_strategy must be an object."
         )
-    allowed = {
-        "source",
-        "female_percentage",
-        "youth_percentage",
-        "female_value",
-        "youth_min_age",
-        "youth_max_age",
-    }
+    allowed = {"source", "quotas", *SHORTHAND_QUOTA_KEYS}
     unexpected = set(selection_strategy) - allowed
     if unexpected:
         raise ValidationError(
@@ -326,11 +477,28 @@ def _normalise_selection_strategy(selection_strategy, model):
             raise ValidationError(
                 "INDIVIDUAL selection_strategy.source must be SELF."
             )
-    elif source != PRIMARY_WORKER_SOURCE:
+    elif not is_one_of(source, {PRIMARY_WORKER_SOURCE, HOUSEHOLD_HEAD_SOURCE}):
         raise ValidationError(
-            "GROUP selection_strategy.source must be PRIMARY_WORKER."
+            "GROUP selection_strategy.source must be PRIMARY_WORKER or "
+            "HOUSEHOLD_HEAD."
         )
 
+    if "quotas" in selection_strategy:
+        shorthand = SHORTHAND_QUOTA_KEYS & set(selection_strategy)
+        if shorthand:
+            raise ValidationError(
+                "enrolment_ranking.selection_strategy.quotas cannot be combined "
+                "with " + ", ".join(sorted(shorthand)) + "."
+            )
+        quotas = _normalise_quotas(selection_strategy["quotas"], source)
+    else:
+        quotas = _shorthand_quotas(selection_strategy)
+
+    return {"source": source, "quotas": quotas}
+
+
+def _shorthand_quotas(selection_strategy):
+    """Translate the female/youth shorthand into female then youth buckets."""
     female = selection_strategy.get("female_percentage", 0)
     youth = selection_strategy.get("youth_percentage", 0)
     for key, value in (
@@ -374,14 +542,195 @@ def _normalise_selection_strategy(selection_strategy, model):
             "with 0 <= minimum <= maximum <= 120."
         )
 
-    return {
-        "source": source,
-        "female_percentage": female,
-        "youth_percentage": youth,
-        "female_value": female_value,
-        "youth_min_age": youth_min,
-        "youth_max_age": youth_max,
+    return [
+        {
+            "key": "female",
+            "percentage": female,
+            "when": [{
+                "field": EnrolmentConfig.registry_gender_field,
+                "filter": "iexact",
+                "type": "string",
+                "value": female_value,
+            }],
+        },
+        {
+            "key": "youth",
+            "percentage": youth,
+            "when": [
+                {"derived": "age", "filter": "gte", "value": youth_min},
+                {"derived": "age", "filter": "lte", "value": youth_max},
+            ],
+        },
+    ]
+
+
+def _normalise_quotas(quotas, source):
+    path = "enrolment_ranking.selection_strategy.quotas"
+    if not isinstance(quotas, list) or not quotas:
+        raise ValidationError(f"{path} must be a non-empty list.")
+
+    normalised = []
+    keys = set()
+    total_percentage = 0
+    for index, quota in enumerate(quotas):
+        quota_path = f"{path}[{index}]"
+        if not isinstance(quota, dict):
+            raise ValidationError(f"{quota_path} must be an object.")
+        unexpected = set(quota) - {"key", "when", "percentage", "count"}
+        if unexpected:
+            raise ValidationError(
+                f"Unsupported {quota_path} keys: " + ", ".join(sorted(unexpected))
+            )
+
+        key = quota.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError(f"{quota_path}.key must be a non-empty string.")
+        if key in keys:
+            raise ValidationError(f"{path} key {key} is used more than once.")
+        keys.add(key)
+
+        if ("percentage" in quota) == ("count" in quota):
+            raise ValidationError(
+                f"{quota_path} must set exactly one of percentage or count."
+            )
+        bucket = {"key": key}
+        if "percentage" in quota:
+            percentage = quota["percentage"]
+            if not is_number(percentage) or not 0 < percentage <= 100:
+                raise ValidationError(
+                    f"{quota_path}.percentage must be above 0 and at most 100."
+                )
+            total_percentage += percentage
+            bucket["percentage"] = percentage
+        else:
+            count = quota["count"]
+            if type(count) is not int or count < 1:
+                raise ValidationError(
+                    f"{quota_path}.count must be a positive integer."
+                )
+            bucket["count"] = count
+
+        conditions = quota.get("when")
+        if not isinstance(conditions, list) or not conditions:
+            raise ValidationError(f"{quota_path}.when must be a non-empty list.")
+        bucket["when"] = [
+            _normalise_quota_condition(
+                condition, f"{quota_path}.when[{condition_index}]", source
+            )
+            for condition_index, condition in enumerate(conditions)
+        ]
+        normalised.append(bucket)
+
+    if total_percentage > 100:
+        raise ValidationError(f"{path} percentages cannot exceed 100.")
+    return normalised
+
+
+def _normalise_quota_condition(condition, path, source):
+    if not isinstance(condition, dict):
+        raise ValidationError(f"{path} must be an object.")
+    unexpected = set(condition) - {
+        "subject", "field", "derived", "filter", "type", "value",
     }
+    if unexpected:
+        raise ValidationError(
+            f"Unsupported {path} keys: " + ", ".join(sorted(unexpected))
+        )
+
+    subject = condition.get("subject")
+    expected_subject = SOURCE_SUBJECTS[source]
+    if subject is not None and subject != expected_subject:
+        raise ValidationError(
+            f"{path}.subject must be {expected_subject} when the "
+            f"selection_strategy.source is {source}."
+        )
+    if ("field" in condition) == ("derived" in condition):
+        raise ValidationError(f"{path} must set exactly one of field or derived.")
+
+    if "derived" in condition:
+        return normalise_derived_condition(condition, path)
+
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    field = condition["field"]
+    if (
+        not isinstance(field, str)
+        or not field.strip()
+        or "__" in field
+        or "=" in field
+    ):
+        raise ValidationError(f"{path}.field must be a json_ext key.")
+    value_type = condition.get("type")
+    if not is_one_of(value_type, VALUE_TYPES):
+        raise ValidationError(
+            f"{path}.type must be one of "
+            + ", ".join(sorted(VALUE_TYPES)) + "."
+        )
+    if not is_one_of(filter_name, FILTERS_BY_TYPE[value_type]):
+        raise ValidationError(
+            f"{path}.filter {filter_name} is not allowed for {value_type}."
+        )
+    if not VALUE_TYPES[value_type](value):
+        raise ValidationError(f"{path}.value must be of type {value_type}.")
+    return {
+        "field": field,
+        "filter": filter_name,
+        "type": value_type,
+        "value": value,
+    }
+
+
+def _normalise_age_condition(condition, path):
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    if condition.get("type", "integer") != "integer":
+        raise ValidationError(f"{path}.type must be integer for age.")
+    if not is_one_of(filter_name, FILTERS_BY_TYPE["integer"]):
+        raise ValidationError(f"{path}.filter {filter_name} is not allowed for age.")
+    if type(value) is not int or not 0 <= value <= 120:
+        raise ValidationError(f"{path}.value must be an age from 0 to 120.")
+    return {"derived": "age", "filter": filter_name, "value": value}
+
+
+def _normalise_district_condition(condition, path):
+    filter_name = condition.get("filter")
+    value = condition.get("value")
+    if condition.get("type", "string") != "string":
+        raise ValidationError(f"{path}.type must be string for district.")
+    if not is_one_of(filter_name, FILTERS_BY_TYPE["string"]):
+        raise ValidationError(f"{path}.filter {filter_name} is not allowed for district.")
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{path}.value must be a district name.")
+    return {"derived": "district", "filter": filter_name, "value": value}
+
+
+# Derived values a condition may read in place of a json_ext field, in quota
+# conditions and profile eligibility criteria: name -> normaliser.
+DERIVED_CONDITION_VALUES = {
+    "age": _normalise_age_condition,
+    "district": _normalise_district_condition,
+}
+
+
+def normalise_derived_condition(condition, path):
+    """Validate a ``derived`` condition and return its normalised form."""
+    if not is_one_of(condition["derived"], DERIVED_CONDITION_VALUES):
+        raise ValidationError(
+            f"{path}.derived {condition['derived']} is not supported; "
+            "supported values: " + ", ".join(sorted(DERIVED_CONDITION_VALUES)) + "."
+        )
+    return DERIVED_CONDITION_VALUES[condition["derived"]](condition, path)
+
+
+def derived_condition_q(condition, model):
+    """Filter households or individuals (``model``) on a normalised derived condition.
+
+    Age needs a date of birth, so it applies to individuals only.
+    """
+    if condition["derived"] == "age":
+        return _age_condition_q("dob", condition["filter"], condition["value"])
+    matching = in_district(model.objects.all(), condition["filter"], condition["value"])
+    return Q(pk__in=matching.values("pk"))
 
 
 def validate_ranking_spec(ranking, model, beneficiary_schema=None):
@@ -393,6 +742,7 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         "limit",
         "score_source",
         "weighted_score",
+        "minimum_score",
         "selection_strategy",
     }
     if unexpected:
@@ -407,7 +757,8 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         )
     _validate_score_source(score_source, model)
     if weighted_score is not None:
-        _validate_weighted_score(weighted_score)
+        _validate_weighted_score(weighted_score, model, score_source)
+    _validate_minimum_score(ranking.get("minimum_score"), weighted_score)
     if ranking.get("selection_strategy") is not None:
         _normalise_selection_strategy(ranking["selection_strategy"], model)
 
@@ -432,7 +783,8 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         for index, item in enumerate(order_by)
     ]
     if weighted_score is not None and not any(
-        item["field"] == WEIGHTED_SCORE_FIELD for item in normalised
+        item["field"] == WEIGHTED_SCORE_FIELD and not item.get("subject")
+        for item in normalised
     ):
         raise ValidationError(
             "enrolment_ranking.order_by must include _weighted_score when "
@@ -441,7 +793,10 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
 
     tie_breaker = ranking.get("tie_breaker", "id")
     _validate_model_path(model, tie_breaker, schema_fields=schema_fields)
-    normalised = [item for item in normalised if item["field"] != tie_breaker]
+    normalised = [
+        item for item in normalised
+        if item.get("subject") or item["field"] != tie_breaker
+    ]
     normalised.append({"field": tie_breaker, "direction": "asc"})
 
     limit = ranking.get("limit", {})
@@ -464,9 +819,14 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
     respect_max = limit.get("respect_max_beneficiaries", True)
     if not isinstance(respect_max, bool):
         raise ValidationError("enrolment_ranking.limit.respect_max_beneficiaries must be boolean.")
-    if weighted_score is not None and not score_source and schema_fields:
+    if weighted_score is not None and schema_fields:
+        candidate_subject = CANDIDATE_SUBJECTS[_phase_type(model)]
         for index, component in enumerate(weighted_score["components"]):
-            if component["field"] not in schema_fields:
+            if (
+                "field" in component
+                and _component_subject(component, model, score_source) == candidate_subject
+                and component["field"] not in schema_fields
+            ):
                 raise ValidationError(
                     "enrolment_ranking.weighted_score.components"
                     f"[{index}].field {component['field']} is not defined in "
@@ -476,50 +836,40 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
 
 
 def benefit_plan_ranking_validation_errors(data, existing=None):
-    """Shared Social Protection validator-registry callback."""
-    from individual.models import Group, Individual
-    from social_protection.models import BeneficiaryStatus, BenefitPlan
+    """Shared Social Protection validator-registry callback.
 
-    if existing is not None and not hasattr(existing, "json_ext"):
-        existing = BenefitPlan.objects.filter(id=existing).first()
-
-    json_ext = data.get("json_ext")
-    if json_ext is None and existing is not None:
-        json_ext = existing.json_ext
-    if isinstance(json_ext, str):
-        try:
-            json_ext = json.loads(json_ext)
-        except (TypeError, ValueError):
-            return []  # Social Protection owns base json_ext validation.
-    if not isinstance(json_ext, dict) or "enrolment_ranking" not in json_ext:
+    Rankings belong in programme profiles, so reject a Phase update that sets
+    enrolment_ranking. Only the json_ext being saved is checked: an update that
+    leaves json_ext out is not blocked by a ranking stored earlier. An empty
+    enrolment_ranking, which the Phase form sends to clear it, is accepted.
+    """
+    if not holds_phase_ranking(data.get("json_ext")):
         return []
-    rankings = json_ext["enrolment_ranking"]
-    if not isinstance(rankings, dict):
-        return [{"message": "enrolment_ranking must be an object."}]
+    return [{
+        "message": "A Phase can no longer have an enrolment_ranking. "
+        + RETIRED_PHASE_RANKING_MESSAGE
+    }]
 
-    plan_type = data.get("type") or getattr(existing, "type", "INDIVIDUAL")
-    model = Group if plan_type == "GROUP" else Individual
-    schema = data.get("beneficiary_data_schema")
-    if schema is None and existing is not None:
-        schema = existing.beneficiary_data_schema
+
+def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ranking"):
+    """Return the errors in rankings keyed by beneficiary status (or ``*``)."""
+    from social_protection.models import BeneficiaryStatus
+
+    if not isinstance(rankings, dict):
+        return [f"{path} must be an object."]
     errors = []
     supported_statuses = set(BeneficiaryStatus.values) | {"*"}
     for status, ranking in rankings.items():
         if not isinstance(status, str) or not status:
-            errors.append({"message": "enrolment_ranking status keys must be strings."})
+            errors.append(f"{path} status keys must be strings.")
             continue
         if status not in supported_statuses:
-            errors.append({
-                "message": f"enrolment_ranking has unsupported status {status}."
-            })
+            errors.append(f"{path} has unsupported status {status}.")
             continue
         try:
-            validate_ranking_spec(ranking, model, schema)
+            validate_ranking_spec(ranking, model, beneficiary_schema)
         except ValidationError as exc:
-            errors.extend(
-                {"message": f"enrolment_ranking.{status}: {message}"}
-                for message in exc.messages
-            )
+            errors.extend(f"{path}.{status}: {message}" for message in exc.messages)
     return errors
 
 
@@ -533,56 +883,114 @@ def _maximum_points(scoring):
     return max([scoring.get("default", 0), *points])
 
 
-def _score_source_expression(field, score_source):
-    if not score_source:
-        return KeyTextTransform(field, "json_ext")
+def _value_expression(component, prefix=""):
+    """Return the value a component reads, from the person or household at ``prefix``.
 
-    primary_worker = authoritative_primary_worker_memberships().filter(
-        group_id=OuterRef("pk")
-    ).order_by("id")
-    value = KeyTextTransform(field, "individual__json_ext")
+    ``prefix`` is empty for the candidate itself and ``individual__`` from a
+    household membership.
+    """
+    derived = component.get("derived")
+    if derived == "age":
+        return F(f"{prefix}dob")
+    if derived == "district":
+        return district_name(f"{prefix}location")
+    value = KeyTextTransform(component["field"], f"{prefix}json_ext")
+    if component["scoring"]["type"] == "numeric_bands":
+        value = Cast(value, output_field=FloatField())
+    return value
+
+
+def _value_output_field(component):
+    if component.get("derived") == "age":
+        return DateField()
+    if "field" in component and component["scoring"]["type"] == "numeric_bands":
+        return FloatField()
+    return CharField()
+
+
+def _component_value(component, subject, model):
+    """Return the value a score component reads for a candidate.
+
+    The candidate's own value comes from its record; a head or primary
+    worker's from that member's record.
+    """
+    if subject == CANDIDATE_SUBJECTS[_phase_type(model)]:
+        return _value_expression(component)
     return Subquery(
-        primary_worker.annotate(_score_value=value).values("_score_value")[:1],
-        output_field=CharField(),
+        _household_member(subject).annotate(
+            _score_value=_value_expression(component, "individual__")
+        ).values("_score_value")[:1],
+        output_field=_value_output_field(component),
+    )
+
+
+def _points_case(value_alias, component):
+    """Turn the value annotated as ``value_alias`` into the component's points."""
+    scoring = component["scoring"]
+    if scoring["type"] == "mapping":
+        cases = [
+            When(**{value_alias: value}, then=Value(float(points)))
+            for value, points in scoring["values"].items()
+        ]
+    else:
+        cases = []
+        for band in scoring["bands"]:
+            if component.get("derived") == "age":
+                # Ages compare as date-of-birth ranges (see age_reference_date).
+                condition = Q()
+                if "min" in band:
+                    condition &= _age_condition_q(value_alias, "gte", band["min"])
+                if "max" in band:
+                    condition &= _age_condition_q(value_alias, "lte", band["max"])
+            else:
+                lookups = {}
+                if "min" in band:
+                    lookups[f"{value_alias}__gte"] = band["min"]
+                if "max" in band:
+                    lookups[f"{value_alias}__lte"] = band["max"]
+                condition = Q(**lookups)
+            cases.append(When(condition, then=Value(float(band["points"]))))
+    return Case(
+        *cases,
+        default=Value(float(scoring.get("default", 0))),
+        output_field=FloatField(),
+    )
+
+
+def _best_member_points(component):
+    """Score every household member and keep the best member's points."""
+    best = MEMBER_SUBJECTS[ANY_MEMBER_SUBJECT]().filter(
+        group_id=OuterRef("pk")
+    ).annotate(
+        _score_value=_value_expression(component, "individual__"),
+    ).annotate(
+        _score_points=_points_case("_score_value", component),
+    ).values("group_id").annotate(
+        _best_points=Max("_score_points"),
+    ).values("_best_points")
+    # A household without members scores the component's default.
+    return Coalesce(
+        Subquery(best[:1], output_field=FloatField()),
+        Value(float(component["scoring"].get("default", 0))),
+        output_field=FloatField(),
     )
 
 
 def build_weighted_score(queryset, weighted_score, score_source=None):
     """Annotate a normalized score in SQL without loading the pool into Python."""
+    model = queryset.model
     source_annotations = {}
-    for index, component in enumerate(weighted_score["components"]):
-        expression = _score_source_expression(component["field"], score_source)
-        if component["scoring"]["type"] == "numeric_bands":
-            expression = Cast(expression, output_field=FloatField())
-        source_annotations[f"_enrolment_score_source_{index}"] = expression
-    scored = queryset.annotate(**source_annotations)
-
     component_annotations = {}
     for index, component in enumerate(weighted_score["components"]):
-        scoring = component["scoring"]
+        subject = _component_subject(component, model, score_source)
+        component_alias = f"_enrolment_score_component_{index}"
+        if subject == ANY_MEMBER_SUBJECT:
+            component_annotations[component_alias] = _best_member_points(component)
+            continue
         source_alias = f"_enrolment_score_source_{index}"
-        if scoring["type"] == "mapping":
-            cases = [
-                When(**{source_alias: value}, then=Value(float(points)))
-                for value, points in scoring["values"].items()
-            ]
-        else:
-            cases = []
-            for band in scoring["bands"]:
-                conditions = {}
-                if "min" in band:
-                    conditions[f"{source_alias}__gte"] = band["min"]
-                if "max" in band:
-                    conditions[f"{source_alias}__lte"] = band["max"]
-                cases.append(
-                    When(**conditions, then=Value(float(band["points"])))
-                )
-        component_annotations[f"_enrolment_score_component_{index}"] = Case(
-            *cases,
-            default=Value(float(scoring.get("default", 0))),
-            output_field=FloatField(),
-        )
-    scored = scored.annotate(**component_annotations)
+        source_annotations[source_alias] = _component_value(component, subject, model)
+        component_annotations[component_alias] = _points_case(source_alias, component)
+    scored = queryset.annotate(**source_annotations).annotate(**component_annotations)
 
     weighted_total = Value(0.0, output_field=FloatField())
     total_weight = 0.0
@@ -606,6 +1014,28 @@ def build_weighted_score(queryset, weighted_score, score_source=None):
     )
 
 
+_AGE_REFERENCE_DATE = ContextVar("enrolment_age_reference_date", default=None)
+
+
+@contextmanager
+def ages_on(day):
+    """Work out derived ages on ``day`` instead of today within the block.
+
+    Approval re-checks an enrolment against the day it was submitted, so a
+    delay before approval does not change who qualifies or ranks by age.
+    """
+    token = _AGE_REFERENCE_DATE.set(day)
+    try:
+        yield
+    finally:
+        _AGE_REFERENCE_DATE.reset(token)
+
+
+def age_reference_date():
+    """Return the day derived ages are worked out on (see ``ages_on``)."""
+    return _AGE_REFERENCE_DATE.get() or date.today()
+
+
 def _years_ago_boundary(today, years):
     try:
         return today.replace(year=today.year - years)
@@ -619,40 +1049,24 @@ def _age_range_dob(today, minimum_age, maximum_age):
     return earliest, latest
 
 
+def _household_member(subject):
+    """Return the outer household's membership for a member ``subject``."""
+    return MEMBER_SUBJECTS[subject]().filter(
+        group_id=OuterRef("pk")
+    ).order_by("id")
+
+
 def _annotate_selection_source(queryset, source):
+    """Annotate the person whose attributes place a candidate in a quota."""
     if source == SELF_SOURCE:
         return queryset.annotate(
-            _selection_gender=KeyTextTransform(
-                EnrolmentConfig.registry_gender_field,
-                "json_ext",
-            ),
+            _selection_individual=F("id"),
             _selection_dob=F("dob"),
         )
 
-    from individual.models import GroupIndividual
-
-    if source == HOUSEHOLD_HEAD_SOURCE:
-        member = GroupIndividual.objects.filter(
-            group_id=OuterRef("pk"),
-            is_deleted=False,
-            group__is_deleted=False,
-            individual__is_deleted=False,
-            role=GroupIndividual.Role.HEAD,
-        ).order_by("id")
-    else:
-        member = authoritative_primary_worker_memberships().filter(
-            group_id=OuterRef("pk")
-        ).order_by("id")
-
-    gender = KeyTextTransform(
-        EnrolmentConfig.registry_gender_field,
-        "individual__json_ext",
-    )
+    member = _household_member(SOURCE_SUBJECTS[source])
     return queryset.annotate(
-        _selection_gender=Subquery(
-            member.annotate(_value=gender).values("_value")[:1],
-            output_field=CharField(),
-        ),
+        _selection_individual=Subquery(member.values("individual_id")[:1]),
         _selection_dob=Subquery(
             member.values("individual__dob")[:1],
             output_field=DateField(),
@@ -660,12 +1074,73 @@ def _annotate_selection_source(queryset, source):
     )
 
 
+def _age_condition_q(dob_field, filter_name, age):
+    """Translate an age comparison into a date-of-birth range on ``dob_field``."""
+    today = age_reference_date()
+    if filter_name == "gt":
+        filter_name, age = "gte", age + 1
+    elif filter_name == "lt":
+        filter_name, age = "lte", age - 1
+    if filter_name == "gte":
+        return Q(**{f"{dob_field}__lte": _years_ago_boundary(today, age)})
+    if filter_name == "lte":
+        return Q(**{f"{dob_field}__gte": _age_range_dob(today, 0, age)[0]})
+    return Q(**{f"{dob_field}__range": _age_range_dob(today, age, age)})
+
+
+def _age_quota_q(condition):
+    return _age_condition_q(
+        "_selection_dob", condition["filter"], condition["value"]
+    )
+
+
+def _district_quota_q(condition):
+    """Match source people whose location lies in the named district."""
+    from individual.models import Individual
+
+    matching = in_district(Individual.objects.all(), condition["filter"], condition["value"])
+    return Q(_selection_individual__in=matching.values("id"))
+
+
+# How each derived value filters the annotated selection source of a quota.
+DERIVED_QUOTA_FILTERS = {
+    "age": _age_quota_q,
+    "district": _district_quota_q,
+}
+
+
+def _quota_q(conditions):
+    """Combine a quota's conditions on the selection source into one filter."""
+    from individual.models import Individual
+
+    query = Q()
+    field_conditions = []
+    for condition in conditions:
+        if "derived" in condition:
+            query &= DERIVED_QUOTA_FILTERS[condition["derived"]](condition)
+        else:
+            field_conditions.append(criterion_to_condition(condition))
+    if field_conditions:
+        matching = CustomFilterWizardStorage.build_custom_filters_queryset(
+            "individual",
+            "Individual",
+            field_conditions,
+            Individual.objects.filter(is_deleted=False),
+        )
+        query &= Q(_selection_individual__in=matching.values("id"))
+    return query
+
+
 def _select_quota_ids(ranked, selection_strategy, cap):
-    """Select female, then non-overlapping youth quotas, then ranked fallback.
+    """Fill quota buckets in order, then the remaining places from the ranked list.
 
     ``ranked`` already carries the configured weighted/deterministic ordering.
-    Each quota and the fallback retain that ordering, and exclusions ensure one
+    Each bucket and the fallback retain that ordering, and exclusions ensure one
     beneficiary cannot occupy more than one place.
+
+    Returns the selected ids and how the places filled: for each bucket the
+    places it reserved and filled, and how many went to the next ranked
+    candidates (``unreserved``).
     """
     strategy = _normalise_selection_strategy(
         selection_strategy,
@@ -673,40 +1148,35 @@ def _select_quota_ids(ranked, selection_strategy, cap):
     )
     candidates = _annotate_selection_source(ranked, strategy["source"])
     selected_ids = []
+    buckets = []
 
-    female_target = math.floor(
-        cap * strategy["female_percentage"] / 100
-    )
-    if female_target:
-        selected_ids.extend(
-            candidates.filter(
-                _selection_gender__iexact=strategy["female_value"]
-            ).values_list("id", flat=True)[:female_target]
-        )
+    for quota in strategy["quotas"]:
+        target = quota.get("count")
+        if target is None:
+            target = math.floor(cap * quota["percentage"] / 100)
+        target = max(0, min(target, cap - len(selected_ids)))
+        filled = []
+        if target:
+            filled = list(
+                candidates.exclude(id__in=selected_ids).filter(
+                    _quota_q(quota["when"])
+                ).values_list("id", flat=True)[:target]
+            )
+            selected_ids.extend(filled)
+        buckets.append({"key": quota["key"], "reserved": target, "filled": len(filled)})
 
-    youth_target = math.floor(
-        cap * strategy["youth_percentage"] / 100
-    )
-    if youth_target:
-        earliest, latest = _age_range_dob(
-            date.today(),
-            strategy["youth_min_age"],
-            strategy["youth_max_age"],
-        )
-        selected_ids.extend(
-            candidates.exclude(id__in=selected_ids).filter(
-                _selection_dob__range=(earliest, latest)
-            ).values_list("id", flat=True)[:youth_target]
-        )
-
+    # Places the buckets leave unfilled always go to the next ranked candidates,
+    # so the Phase reaches its target whenever enough candidates are eligible.
     remaining = cap - len(selected_ids)
+    unreserved = []
     if remaining:
-        selected_ids.extend(
+        unreserved = list(
             candidates.exclude(id__in=selected_ids).values_list(
                 "id", flat=True
             )[:remaining]
         )
-    return selected_ids
+        selected_ids.extend(unreserved)
+    return selected_ids, {"buckets": buckets, "unreserved": len(unreserved)}
 
 
 def calculate_cap(
@@ -732,7 +1202,14 @@ def build_order_by(queryset, order_items):
         alias = f"_enrolment_rank_{index}"
         field_name = item["field"]
         expression = F(field_name)
-        if field_name.startswith("json_ext__"):
+        if item.get("subject"):
+            member = _household_member(item["subject"])
+            value = KeyTextTransform(field_name, "individual__json_ext")
+            expression = Subquery(
+                member.annotate(_order_value=value).values("_order_value")[:1],
+                output_field=CharField(),
+            )
+        elif field_name.startswith("json_ext__"):
             expression = KeyTextTransform.from_lookup(field_name)
         elif field_name != WEIGHTED_SCORE_FIELD:
             try:
@@ -758,15 +1235,21 @@ def build_order_by(queryset, order_items):
     return queryset.annotate(**annotations).order_by(*ordering)
 
 
+def _order_item_label(item):
+    if item.get("subject"):
+        return f"{item['subject']}.{item['field']}"
+    return item["field"]
+
+
 def _cast_error(order_items, exc, weighted_score=None):
     casts = ", ".join(
-        f"{item['field']} ({item['cast']})"
+        f"{_order_item_label(item)} ({item['cast']})"
         for item in order_items
         if item.get("cast")
     )
     if weighted_score:
         weighted_fields = ", ".join(
-            component["field"]
+            _component_name(component)
             for component in weighted_score.get("components", [])
             if component.get("scoring", {}).get("type") == "numeric_bands"
         )
@@ -792,11 +1275,24 @@ def rank_and_cap_queryset(
     Approval revalidation can disable the percentage limit after it was applied
     during confirmation without disabling the remaining capacity limit.
     """
-    ranking = load_ranking_spec(benefit_plan, status)
+    from enrolment.profiles import profile_ranking_spec, resolve_programme_profile
+
+    if holds_phase_ranking(benefit_plan.json_ext):
+        # Refuse rather than ignore it: without the ranking the Phase would
+        # enrol its whole pool, uncapped.
+        raise ValidationError(
+            f"Phase {benefit_plan.code} still has an enrolment_ranking, which "
+            f"is no longer applied, so it cannot enrol. {RETIRED_PHASE_RANKING_MESSAGE}"
+        )
+    ranking = profile_ranking_spec(benefit_plan, status)
+    profile_key = resolve_programme_profile(benefit_plan)[0]
     pool_size = queryset.count()
     if ranking is None:
         return queryset, {
             "pool_size": pool_size,
+            "below_minimum_score": 0,
+            "programme_profile": profile_key,
+            "quota_fill": None,
             "cap_applied": None,
             "will_enrol": pool_size,
             "ranking": None,
@@ -811,6 +1307,21 @@ def rank_and_cap_queryset(
     )
     weighted_score = ranking.get("weighted_score")
     score_source = ranking.get("score_source")
+    minimum_score = ranking.get("minimum_score")
+    below_minimum_score = 0
+    if minimum_score is not None:
+        # Candidates below the minimum are not part of the pool: the cap,
+        # percentage limit and quotas only ever see those who reach it.
+        reaching = build_weighted_score(queryset, weighted_score, score_source).filter(
+            **{f"{WEIGHTED_SCORE_FIELD}__gte": minimum_score - SCORE_TOLERANCE}
+        )
+        queryset = queryset.filter(id__in=reaching.values("id"))
+        try:
+            reaching_count = queryset.count()
+        except DataError as exc:
+            _cast_error(order_items, exc, weighted_score)
+        below_minimum_score = pool_size - reaching_count
+        pool_size = reaching_count
 
     def apply_ranking(source_queryset):
         if weighted_score is not None:
@@ -833,7 +1344,7 @@ def rank_and_cap_queryset(
     selection_strategy = ranking.get("selection_strategy")
     if selection_strategy is not None:
         try:
-            selected_ids = _select_quota_ids(
+            selected_ids, quota_fill = _select_quota_ids(
                 ranked,
                 selection_strategy,
                 will_enrol,
@@ -843,6 +1354,9 @@ def rank_and_cap_queryset(
         capped = apply_ranking(queryset.filter(id__in=selected_ids))
         return capped, {
             "pool_size": pool_size,
+            "below_minimum_score": below_minimum_score,
+            "programme_profile": profile_key,
+            "quota_fill": quota_fill,
             "cap_applied": cap if has_limit else None,
             "will_enrol": len(selected_ids),
             "ranking": ranking,
@@ -876,6 +1390,9 @@ def rank_and_cap_queryset(
         capped = apply_ranking(queryset.filter(id__in=capped_ids))
     return capped, {
         "pool_size": pool_size,
+        "below_minimum_score": below_minimum_score,
+        "programme_profile": profile_key,
+        "quota_fill": None,
         "cap_applied": cap if has_limit else None,
         "will_enrol": will_enrol,
         "ranking": ranking,
@@ -885,5 +1402,4 @@ def rank_and_cap_queryset(
 
 
 # British-spelling compatibility for callers introduced during development.
-load_enrolment_ranking = load_ranking_spec
 validate_and_normalise_ranking = validate_ranking_spec
