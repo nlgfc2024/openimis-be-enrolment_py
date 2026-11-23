@@ -2,7 +2,7 @@ import json
 import math
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.db import DataError
@@ -229,7 +229,11 @@ def _validate_score_source(score_source, model):
         )
 
 
-def _validate_scoring(scoring, path):
+def validate_scoring(scoring, path="scoring"):
+    """Check a component's ``scoring`` (``mapping`` or ``numeric_bands``); raises ValidationError naming ``path``.
+
+    Public so other modules can keep score rules in the same shape as enrolment.
+    """
     if not isinstance(scoring, dict):
         raise ValidationError(f"{path} must be an object.")
     scoring_type = scoring.get("type")
@@ -314,6 +318,9 @@ def _validate_scoring(scoring, path):
         raise ValidationError(
             f"{path}.maximum_points cannot be smaller than configured points."
         )
+
+
+_validate_scoring = validate_scoring
 
 
 def _phase_type(model):
@@ -873,7 +880,8 @@ def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ran
     return errors
 
 
-def _maximum_points(scoring):
+def maximum_points(scoring):
+    """The most points ``scoring`` can give: its ``maximum_points``, else its highest configured points."""
     if scoring.get("maximum_points") is not None:
         return scoring["maximum_points"]
     if scoring["type"] == "mapping":
@@ -881,6 +889,9 @@ def _maximum_points(scoring):
     else:
         points = [band["points"] for band in scoring["bands"]]
     return max([scoring.get("default", 0), *points])
+
+
+_maximum_points = maximum_points
 
 
 def _value_expression(component, prefix=""):
@@ -955,6 +966,55 @@ def _points_case(value_alias, component):
         default=Value(float(scoring.get("default", 0))),
         output_field=FloatField(),
     )
+
+
+def _json_text(value):
+    """``value`` as Postgres gives a json_ext key as text (``->>``), which mapping keys are compared with."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _band_matches(band, value, derived):
+    if derived == "age":
+        # Same date-of-birth bounds as _age_condition_q, so a birthday counts the same way.
+        today = age_reference_date()
+        return ("min" not in band or value <= _years_ago_boundary(today, band["min"])) and (
+            "max" not in band or value >= _age_range_dob(today, 0, band["max"])[0])
+    return ("min" not in band or value >= band["min"]) and ("max" not in band or value <= band["max"])
+
+
+def component_points(component, value):
+    """The points a weighted_score component gives ``value``, the same as build_weighted_score works out in SQL.
+
+    ``value`` is what the component reads: the json_ext answer for a ``field`` component, the date of birth
+    for ``derived: age`` (ages on age_reference_date()), the district name for ``derived: district``. None,
+    like a missing key, scores the default. A numeric_bands value that isn't a number raises ValueError, as
+    the SQL cast fails on it.
+    """
+    scoring = component["scoring"]
+    default = float(scoring.get("default", 0))
+    if value is None:
+        return default
+    if scoring["type"] == "mapping":
+        points = scoring["values"].get(_json_text(value))
+        return default if points is None else float(points)
+    derived = component.get("derived")
+    if derived == "age":
+        if isinstance(value, datetime):
+            value = value.date()
+        if not isinstance(value, date):
+            raise ValueError(f"derived age needs a date of birth, not {value!r}.")
+    else:
+        if isinstance(value, bool):
+            raise ValueError(f"{value!r} is not a number.")
+        value = float(value)
+    for band in scoring["bands"]:
+        if _band_matches(band, value, derived):
+            return float(band["points"])
+    return default
 
 
 def _best_member_points(component):
