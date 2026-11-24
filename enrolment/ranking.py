@@ -472,7 +472,7 @@ def _normalise_selection_strategy(selection_strategy, model):
         raise ValidationError(
             "enrolment_ranking.selection_strategy must be an object."
         )
-    allowed = {"source", "quotas", *SHORTHAND_QUOTA_KEYS}
+    allowed = {"source", "quotas", "spillover", *SHORTHAND_QUOTA_KEYS}
     unexpected = set(selection_strategy) - allowed
     if unexpected:
         raise ValidationError(
@@ -503,7 +503,19 @@ def _normalise_selection_strategy(selection_strategy, model):
     else:
         quotas = _shorthand_quotas(selection_strategy)
 
-    return {"source": source, "quotas": quotas}
+    spillover = selection_strategy.get("spillover", True)
+    if not isinstance(spillover, bool):
+        raise ValidationError(
+            "enrolment_ranking.selection_strategy.spillover must be true or false."
+        )
+    return {"source": source, "quotas": quotas, "spillover": spillover}
+
+
+def normalise_selection_strategy(selection_strategy, model):
+    """Validate a ``selection_strategy`` for candidates of ``model`` (Individual
+    or Group) and return it normalised: ``source``, ``quotas`` and ``spillover``.
+    Raises ValidationError naming the first problem."""
+    return _normalise_selection_strategy(selection_strategy, model)
 
 
 def _shorthand_quotas(selection_strategy):
@@ -639,7 +651,7 @@ def _normalise_quota_condition(condition, path, source):
     if not isinstance(condition, dict):
         raise ValidationError(f"{path} must be an object.")
     unexpected = set(condition) - {
-        "subject", "field", "derived", "filter", "type", "value",
+        "subject", "field", "derived", "filter", "type", "value", "answer", "location_type",
     }
     if unexpected:
         raise ValidationError(
@@ -713,11 +725,38 @@ def _normalise_district_condition(condition, path):
     return {"derived": "district", "filter": filter_name, "value": value}
 
 
+def _normalise_location_code_condition(condition, path):
+    """An answer (json_ext key) holding a location code: the code given or any code it replaced."""
+    from location.apps import LocationConfig
+
+    answer, location_type, value = condition.get("answer"), condition.get("location_type"), condition.get("value")
+    if not isinstance(answer, str) or not answer.strip() or "__" in answer or "=" in answer:
+        raise ValidationError(f"{path}.answer must be the json_ext key holding the location code.")
+    if location_type not in (LocationConfig.location_types or []):
+        raise ValidationError(
+            f"{path}.location_type must be one of " + ", ".join(LocationConfig.location_types or []) + "."
+        )
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{path}.value must be a location code.")
+    if condition.get("filter", "exact") != "exact" or condition.get("type", "string") != "string":
+        raise ValidationError(f"{path} matches a location code exactly; leave out filter and type.")
+    return {"derived": "location_code", "answer": answer, "location_type": location_type, "value": value.strip()}
+
+
+def location_code_q(condition, prefix=""):
+    """Rows whose answer holds the condition's code or a code it replaced (enrolment.locations)."""
+    from enrolment.locations import location_codes
+
+    codes = location_codes(condition["location_type"], condition["value"])
+    return Q(**{f"{prefix}json_ext__{condition['answer']}__in": codes})
+
+
 # Derived values a condition may read in place of a json_ext field, in quota
 # conditions and profile eligibility criteria: name -> normaliser.
 DERIVED_CONDITION_VALUES = {
     "age": _normalise_age_condition,
     "district": _normalise_district_condition,
+    "location_code": _normalise_location_code_condition,
 }
 
 
@@ -738,6 +777,8 @@ def derived_condition_q(condition, model):
     """
     if condition["derived"] == "age":
         return _age_condition_q("dob", condition["filter"], condition["value"])
+    if condition["derived"] == "location_code":
+        return location_code_q(condition)
     matching = in_district(model.objects.all(), condition["filter"], condition["value"])
     return Q(pk__in=matching.values("pk"))
 
@@ -1227,10 +1268,18 @@ def _district_quota_q(condition):
     return Q(_selection_individual__in=matching.values("id"))
 
 
+def _location_code_quota_q(condition):
+    """Match source people whose answer holds the code or a code it replaced."""
+    from individual.models import Individual
+
+    return Q(_selection_individual__in=Individual.objects.filter(location_code_q(condition)).values("id"))
+
+
 # How each derived value filters the annotated selection source of a quota.
 DERIVED_QUOTA_FILTERS = {
     "age": _age_quota_q,
     "district": _district_quota_q,
+    "location_code": _location_code_quota_q,
 }
 
 
@@ -1256,52 +1305,74 @@ def _quota_q(conditions):
     return query
 
 
+def allocate_places(ranked_ids, quotas, members, cap, spillover=True):
+    """Fill quota buckets in order from ``ranked_ids`` (best first), then, with
+    ``spillover``, the remaining places from the next ranked candidates.
+
+    ``members`` maps each quota key to the ids its conditions match. A bucket
+    reserves its ``count``, or ``percentage`` of ``cap`` rounded down, and never
+    more than the places left. One candidate occupies at most one place.
+
+    Returns the selected ids in the order they were placed and how the places
+    filled: for each bucket the places it reserved and filled, and how many went
+    to the next ranked candidates (``unreserved``).
+    """
+    selected, taken, buckets = [], set(), []
+    for quota in quotas:
+        target = quota.get("count")
+        if target is None:
+            target = math.floor(cap * quota["percentage"] / 100)
+        target = max(0, min(target, cap - len(selected)))
+        eligible = members.get(quota["key"], ())
+        filled = []
+        if target:
+            for candidate in ranked_ids:
+                if candidate not in taken and candidate in eligible:
+                    filled.append(candidate)
+                    taken.add(candidate)
+                    if len(filled) == target:
+                        break
+        selected.extend(filled)
+        buckets.append({"key": quota["key"], "reserved": target, "filled": len(filled)})
+
+    unreserved = []
+    # Without spillover, places a bucket leaves unfilled stay empty
+    if spillover:
+        remaining = cap - len(selected)
+        for candidate in ranked_ids:
+            if remaining <= 0:
+                break
+            if candidate not in taken:
+                unreserved.append(candidate)
+                taken.add(candidate)
+                remaining -= 1
+        selected.extend(unreserved)
+    return selected, {"buckets": buckets, "unreserved": len(unreserved)}
+
+
+def quota_members(candidates, quotas, source=SELF_SOURCE):
+    """{quota key: set of candidate ids} of the ``candidates`` queryset
+    (Individuals for SELF, Groups otherwise) each quota's conditions match."""
+    annotated = _annotate_selection_source(candidates, source)
+    return {
+        quota["key"]: set(annotated.filter(_quota_q(quota["when"])).values_list("id", flat=True))
+        for quota in quotas
+    }
+
+
 def _select_quota_ids(ranked, selection_strategy, cap):
-    """Fill quota buckets in order, then the remaining places from the ranked list.
+    """Select ``cap`` places from the ranked queryset by its selection strategy.
 
-    ``ranked`` already carries the configured weighted/deterministic ordering.
-    Each bucket and the fallback retain that ordering, and exclusions ensure one
-    beneficiary cannot occupy more than one place.
-
-    Returns the selected ids and how the places filled: for each bucket the
-    places it reserved and filled, and how many went to the next ranked
-    candidates (``unreserved``).
+    ``ranked`` already carries the configured weighted/deterministic ordering,
+    which the buckets and the fallback keep (allocate_places).
     """
     strategy = _normalise_selection_strategy(
         selection_strategy,
         ranked.model,
     )
-    candidates = _annotate_selection_source(ranked, strategy["source"])
-    selected_ids = []
-    buckets = []
-
-    for quota in strategy["quotas"]:
-        target = quota.get("count")
-        if target is None:
-            target = math.floor(cap * quota["percentage"] / 100)
-        target = max(0, min(target, cap - len(selected_ids)))
-        filled = []
-        if target:
-            filled = list(
-                candidates.exclude(id__in=selected_ids).filter(
-                    _quota_q(quota["when"])
-                ).values_list("id", flat=True)[:target]
-            )
-            selected_ids.extend(filled)
-        buckets.append({"key": quota["key"], "reserved": target, "filled": len(filled)})
-
-    # Places the buckets leave unfilled always go to the next ranked candidates,
-    # so the Phase reaches its target whenever enough candidates are eligible.
-    remaining = cap - len(selected_ids)
-    unreserved = []
-    if remaining:
-        unreserved = list(
-            candidates.exclude(id__in=selected_ids).values_list(
-                "id", flat=True
-            )[:remaining]
-        )
-        selected_ids.extend(unreserved)
-    return selected_ids, {"buckets": buckets, "unreserved": len(unreserved)}
+    ranked_ids = list(ranked.values_list("id", flat=True))
+    members = quota_members(ranked, strategy["quotas"], strategy["source"])
+    return allocate_places(ranked_ids, strategy["quotas"], members, cap, strategy["spillover"])
 
 
 def calculate_cap(

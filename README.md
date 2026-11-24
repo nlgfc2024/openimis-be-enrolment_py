@@ -293,16 +293,42 @@ For other quotas, replace the female/youth keys with an ordered `quotas` list:
 - `when` conditions all apply to the `source` person. A condition is either a
   `json_ext` `field` with `filter`, `type` (`string`, `integer`, `numeric` or
   `boolean`) and `value`, `derived: age` with an integer `filter` and `value`,
-  or `derived: district` with a string `filter` and a district name as
-  `value`. An optional `subject` must name the source (`self`,
-  `primary_worker` or `head`).
+  `derived: district` with a string `filter` and a district name as `value`,
+  or `derived: location_code` (below). An optional `subject` must name the
+  source (`self`, `primary_worker` or `head`).
 - Buckets fill in order from the ranked list, and nobody takes more than one
   place. Places a bucket cannot fill, and places no bucket reserves, then go to
   the next ranked candidates, so the Phase reaches its target whenever enough
-  candidates are eligible.
+  candidates are eligible. With `"spillover": false` they stay empty instead,
+  for strict limits such as fixed places per city.
 - `quotas` cannot be combined with `female_percentage`, `youth_percentage`,
   `female_value`, `youth_min_age` or `youth_max_age`. That shorthand is
   equivalent to a `female` bucket followed by a `youth` bucket.
+
+### Location codes in answers
+
+A condition on an answer that holds a location code, in quota `when` lists and
+profile eligibility criteria:
+
+```json
+{"derived": "location_code", "answer": "biz_city", "location_type": "R", "value": "325"}
+```
+
+It matches the code given and every code that location had before. A module
+that replaces location codes registers that history with
+`enrolment.locations.register_location_code_history(former_codes)`; msr_etl
+does, so an answer given with a temporary code still matches once the real code
+replaces it. Without a registered history only the code given matches. It isn't
+a score item: score a code answer with a `mapping` listing each code.
+
+### Reusing the selection
+
+Other modules select places the same way through `enrolment.ranking`:
+`normalise_selection_strategy(strategy, model)` validates and normalises a
+`selection_strategy`; `quota_members(candidates, quotas, source)` gives the ids
+each quota's conditions match; `allocate_places(ranked_ids, quotas, members,
+cap, spillover)` fills the buckets and the remaining places, returning the
+selected ids and how each bucket filled.
 
 ## Optional household district filter
 

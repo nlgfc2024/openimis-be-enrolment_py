@@ -35,7 +35,7 @@ from enrolment.ranking import (
 DEFAULT_PROFILE = "default"
 PROFILE_KEYS = {"description", "eligibility", "ranking"}
 ELIGIBILITY_KEYS = {"criteria"}
-CRITERION_KEYS = {"subject", "field", "derived", "filter", "type", "value"}
+CRITERION_KEYS = {"subject", "field", "derived", "filter", "type", "value", "answer", "location_type"}
 SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
 PHASE_TYPES = tuple(CANDIDATE_SUBJECTS)
 
