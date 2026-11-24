@@ -1,6 +1,7 @@
 from datetime import date, datetime
 
 from django.core.exceptions import ValidationError
+from django.db import DataError, transaction
 from django.test import SimpleTestCase, TestCase
 
 from core.test_helpers import LogInHelper
@@ -100,6 +101,38 @@ class ScoringHelpersMatchSqlTest(TestCase):
             for dob in (date(2008, 11, 23), date(2008, 11, 24), date(1990, 11, 24), date(1990, 11, 23)):
                 with self.subTest(dob=dob):
                     self.assertEqual(self._sql_points(AGE, dob=dob), component_points(AGE, dob))
+
+    def _either(self, component, value):
+        """(points or "error") from SQL and from component_points for one json_ext value."""
+        try:
+            with transaction.atomic():
+                sql = self._sql_points(component, {"v": value})
+        except DataError:
+            sql = "error"
+        try:
+            python = round(component_points(component, value), 6)
+        except ValueError:
+            python = "error"
+        return sql, python
+
+    def test_mapping_parity_with_jsonb_text(self):
+        values = {'["\u00e9"]': 10, '{"a": 2, "b": 1}': 9, "0.0000001": 8, '{"k": [1.5, "\u00e9"]}': 7,
+                  "100000000000000000000": 6, "1.0": 5, "0.0": 4, '["x", 1, null, true]': 3, 'a"b': 2}
+        component = {"field": "v", "weight": 10, "scoring": {"type": "mapping", "values": values}}
+        for value in (["\u00e9"], {"b": 1, "a": 2}, 1e-7, {"k": [1.5, "\u00e9"]}, 1e20, 1.0, -0.0,
+                      ["x", 1, None, True], 'a"b', {"ab": 1, "b": 2}, "\u00e9"):
+            with self.subTest(value=value):
+                sql, python = self._either(component, value)
+                self.assertEqual(sql, python)
+
+    def test_numeric_parity_with_postgres_cast(self):
+        component = {"field": "v", "weight": 15, "scoring": {"type": "numeric_bands", "default": 1, "bands": [
+            {"min": 5000001, "points": 15}, {"min": 3000000, "max": 5000000, "points": 12}]}}
+        for value in ("1e309", "1_000", "NaN", "-nan", "inf", "-Infinity", "1e-400", "1e-320", "0x4C4B41",
+                      " 4000000 ", "4e6", "", " ", "\uff11\uff12", "1.5.2", "0e999", 12345678901234567890, 1e-7):
+            with self.subTest(value=value):
+                sql, python = self._either(component, value)
+                self.assertEqual(sql, python)
 
     def test_district(self):
         village = create_village_in("Zomba")
