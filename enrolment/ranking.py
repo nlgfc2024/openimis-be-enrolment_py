@@ -1,8 +1,10 @@
 import json
 import math
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.db import DataError
@@ -968,13 +970,72 @@ def _points_case(value_alias, component):
     )
 
 
-def _json_text(value):
-    """``value`` as Postgres gives a json_ext key as text (``->>``), which mapping keys are compared with."""
+def _jsonb_number(value):
+    """A JSON number as Postgres prints it (numeric output: no exponent, no negative zero)."""
+    number = Decimal(json.dumps(value))
+    if not number.is_finite():
+        raise ValueError(f"{value!r} is not a JSON number.")
+    text = format(number, "f")
+    return text[1:] if number.is_zero() and text.startswith("-") else text
+
+
+def _jsonb_string(text):
+    escapes = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r",
+               "\t": "\\t"}
+    return '"' + "".join(escapes.get(c, f"\\u{ord(c):04x}" if ord(c) < 0x20 else c) for c in text) + '"'
+
+
+def _jsonb_text(value):
+    """``value`` serialised as Postgres prints a jsonb value: ", " and ": " separators, non-ASCII kept, object keys
+    ordered by byte length then bytes."""
+    if value is None:
+        return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (dict, list)):
-        return json.dumps(value)
-    return str(value)
+    if isinstance(value, (int, float)):
+        return _jsonb_number(value)
+    if isinstance(value, str):
+        return _jsonb_string(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_jsonb_text(item) for item in value) + "]"
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: (len(str(key).encode()), str(key).encode()))
+        return "{" + ", ".join(f"{_jsonb_string(str(key))}: {_jsonb_text(value[key])}" for key in keys) + "}"
+    raise ValueError(f"{value!r} is not a JSON value.")
+
+
+def _json_text(value):
+    """``value`` as Postgres gives a json_ext key as text (``->>``), which mapping keys are compared with."""
+    if isinstance(value, str):
+        return value
+    return _jsonb_text(value)
+
+
+_FLOAT8_DECIMAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
+_FLOAT8_HEX = re.compile(r"[+-]?0[xX]([0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)([pP][+-]?\d+)?", re.ASCII)
+_FLOAT8_SPECIAL = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE | re.ASCII)
+_FLOAT8_SPACE = " \t\n\r\f\v"
+
+
+def _float8(value):
+    """``value`` cast to double precision as Postgres casts json_ext text; ValueError where the cast fails."""
+    text = _json_text(value).strip(_FLOAT8_SPACE)
+    if _FLOAT8_SPECIAL.fullmatch(text):
+        return float(text.lower().replace("infinity", "inf"))
+    if _FLOAT8_HEX.fullmatch(text):
+        try:
+            number = float.fromhex(text)
+        except OverflowError:
+            raise ValueError(f'"{text}" is out of range for type double precision')
+        nonzero = any(digit not in "0." for digit in re.split("[pP]", text.lstrip("+-")[2:])[0])
+    elif _FLOAT8_DECIMAL.fullmatch(text):
+        number = float(text)
+        nonzero = Decimal(text) != 0
+    else:
+        raise ValueError(f'invalid input syntax for type double precision: "{text}"')
+    if math.isinf(number) or (number == 0 and nonzero):
+        raise ValueError(f'"{text}" is out of range for type double precision')
+    return number
 
 
 def _band_matches(band, value, derived):
@@ -983,6 +1044,9 @@ def _band_matches(band, value, derived):
         today = age_reference_date()
         return ("min" not in band or value <= _years_ago_boundary(today, band["min"])) and (
             "max" not in band or value >= _age_range_dob(today, 0, band["max"])[0])
+    if math.isnan(value):
+        # Postgres orders NaN above every number
+        return "max" not in band
     return ("min" not in band or value >= band["min"]) and ("max" not in band or value <= band["max"])
 
 
@@ -991,8 +1055,9 @@ def component_points(component, value):
 
     ``value`` is what the component reads: the json_ext answer for a ``field`` component, the date of birth
     for ``derived: age`` (ages on age_reference_date()), the district name for ``derived: district``. None,
-    like a missing key, scores the default. A numeric_bands value that isn't a number raises ValueError, as
-    the SQL cast fails on it.
+    like a missing key, scores the default. Mapping keys are compared with the value's jsonb text, and a
+    numeric_bands value is read as Postgres casts it to double precision: ValueError where that cast fails,
+    and NaN above every number.
     """
     scoring = component["scoring"]
     default = float(scoring.get("default", 0))
@@ -1010,7 +1075,7 @@ def component_points(component, value):
     else:
         if isinstance(value, bool):
             raise ValueError(f"{value!r} is not a number.")
-        value = float(value)
+        value = _float8(value)
     for band in scoring["bands"]:
         if _band_matches(band, value, derived):
             return float(band["points"])
