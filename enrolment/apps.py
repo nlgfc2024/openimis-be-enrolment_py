@@ -131,6 +131,7 @@ class EnrolmentConfig(AppConfig):
             or max_score <= 0
         ):
             errors.append("max_enrolment_score must be a positive number.")
+            max_score = None
         district_type = config.get("district_location_type")
         if not on_load and isinstance(district_type, str) and district_type.strip():
             from location.apps import LocationConfig
@@ -141,7 +142,7 @@ class EnrolmentConfig(AppConfig):
                     "location types: " + ", ".join(LocationConfig.location_types) + "."
                 )
         profiles = config.get("programme_profiles", DEFAULT_CONFIG["programme_profiles"])
-        errors.extend(validate_programme_profiles(profiles))
+        errors.extend(validate_programme_profiles(profiles, max_score))
         if not on_load and not errors:
             errors.extend(district_name_errors(profiles, district_type))
         if errors:

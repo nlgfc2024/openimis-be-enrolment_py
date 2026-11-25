@@ -393,7 +393,7 @@ def _validate_derived_component(component, path, subject):
                     )
 
 
-def _validate_weighted_score(weighted_score, model, score_source=None):
+def _validate_weighted_score(weighted_score, model, score_source=None, max_score=None):
     if not isinstance(weighted_score, dict):
         raise ValidationError("enrolment_ranking.weighted_score must be an object.")
     unexpected = set(weighted_score) - {"normalise_to", "components"}
@@ -407,8 +407,11 @@ def _validate_weighted_score(weighted_score, model, score_source=None):
         normalise_to,
         "enrolment_ranking.weighted_score.normalise_to",
     )
-    max_score = EnrolmentConfig.max_enrolment_score
-    if normalise_to > max_score:
+    # Config validation passes the maximum of the configuration being checked:
+    # at startup it is validated before EnrolmentConfig is loaded.
+    if max_score is None:
+        max_score = EnrolmentConfig.max_enrolment_score
+    if max_score is not None and normalise_to > max_score:
         raise ValidationError(
             "enrolment_ranking.weighted_score.normalise_to cannot exceed "
             f"{max_score:g}, the maximum enrolment score."
@@ -450,7 +453,7 @@ def _validate_weighted_score(weighted_score, model, score_source=None):
     total_points = sum(
         _maximum_points(component["scoring"]) for component in components
     )
-    if total_points > max_score:
+    if max_score is not None and total_points > max_score:
         raise ValidationError(
             "enrolment_ranking.weighted_score components add up to "
             f"{total_points:g} points, more than the maximum enrolment score "
@@ -733,7 +736,7 @@ def derived_condition_q(condition, model):
     return Q(pk__in=matching.values("pk"))
 
 
-def validate_ranking_spec(ranking, model, beneficiary_schema=None):
+def validate_ranking_spec(ranking, model, beneficiary_schema=None, max_score=None):
     if not isinstance(ranking, dict):
         raise ValidationError("enrolment_ranking status entries must be objects.")
     unexpected = set(ranking) - {
@@ -757,7 +760,7 @@ def validate_ranking_spec(ranking, model, beneficiary_schema=None):
         )
     _validate_score_source(score_source, model)
     if weighted_score is not None:
-        _validate_weighted_score(weighted_score, model, score_source)
+        _validate_weighted_score(weighted_score, model, score_source, max_score)
     _validate_minimum_score(ranking.get("minimum_score"), weighted_score)
     if ranking.get("selection_strategy") is not None:
         _normalise_selection_strategy(ranking["selection_strategy"], model)
@@ -851,7 +854,9 @@ def benefit_plan_ranking_validation_errors(data, existing=None):
     }]
 
 
-def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ranking"):
+def ranking_errors(
+    rankings, model, beneficiary_schema=None, path="enrolment_ranking", max_score=None
+):
     """Return the errors in rankings keyed by beneficiary status (or ``*``)."""
     from social_protection.models import BeneficiaryStatus
 
@@ -867,7 +872,7 @@ def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ran
             errors.append(f"{path} has unsupported status {status}.")
             continue
         try:
-            validate_ranking_spec(ranking, model, beneficiary_schema)
+            validate_ranking_spec(ranking, model, beneficiary_schema, max_score)
         except ValidationError as exc:
             errors.extend(f"{path}.{status}: {message}" for message in exc.messages)
     return errors

@@ -252,6 +252,43 @@ class EnrollmentCriterionNormalizationTest(SimpleTestCase):
                         {**DEFAULT_CONFIG, "max_enrolment_score": value}
                     )
 
+    def _config_with_weighted_profile(self, normalise_to, **config):
+        from enrolment.apps import DEFAULT_CONFIG
+
+        ranking = self._ranking_with_points(40, 25, normalise_to=normalise_to)
+        return {
+            **DEFAULT_CONFIG,
+            "programme_profiles": {"RMEP": {"ranking": {"*": ranking}}},
+            **config,
+        }
+
+    @patch.object(EnrolmentConfig, "max_enrolment_score", None)
+    def test_stored_weighted_profile_is_validated_before_config_is_loaded(self):
+        # ready() validates the stored configuration before loading it.
+        EnrolmentConfig._validate_config(
+            self._config_with_weighted_profile(65), on_load=True
+        )
+
+    @patch.object(EnrolmentConfig, "max_enrolment_score", 100)
+    def test_weighted_profile_is_checked_against_the_configured_maximum(self):
+        with self.assertRaisesMessage(
+            ValidationError,
+            "normalise_to cannot exceed 50, the maximum enrolment score",
+        ):
+            EnrolmentConfig._validate_config(
+                self._config_with_weighted_profile(65, max_enrolment_score=50)
+            )
+
+    @patch.object(EnrolmentConfig, "max_enrolment_score", None)
+    def test_invalid_maximum_score_is_reported_with_weighted_profile(self):
+        with self.assertRaisesMessage(
+            ValidationError, "max_enrolment_score must be a positive number."
+        ):
+            EnrolmentConfig._validate_config(
+                self._config_with_weighted_profile(65, max_enrolment_score=0),
+                on_load=True,
+            )
+
     def test_minimum_score_is_validated(self):
         valid = self._ranking_with_points(60, 40)
         valid["minimum_score"] = 60
