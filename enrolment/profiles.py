@@ -40,8 +40,12 @@ SUBJECTS = set(CANDIDATE_SUBJECTS.values()) | set(MEMBER_SUBJECTS)
 PHASE_TYPES = tuple(CANDIDATE_SUBJECTS)
 
 
-def validate_programme_profiles(profiles):
-    """Return the configuration errors in a ``programme_profiles`` block."""
+def validate_programme_profiles(profiles, max_score=None):
+    """Return the configuration errors in a ``programme_profiles`` block.
+
+    ``max_score`` is the configuration's max_enrolment_score; without it the
+    loaded EnrolmentConfig value is used.
+    """
     if not isinstance(profiles, dict):
         return ["programme_profiles must be an object keyed by BenefitPlan code."]
     errors = []
@@ -70,7 +74,7 @@ def validate_programme_profiles(profiles):
             _eligibility_errors(profile.get("eligibility", {}), f"{path}.eligibility")
         )
         if not unexpected and not profile_errors:
-            profile_errors.extend(_unsuitable_profile_errors(profile, path))
+            profile_errors.extend(_unsuitable_profile_errors(profile, path, max_score))
         errors.extend(profile_errors)
     return errors
 
@@ -143,10 +147,10 @@ def _district_names(profile, path):
                     )
 
 
-def _unsuitable_profile_errors(profile, path):
+def _unsuitable_profile_errors(profile, path, max_score=None):
     """Report a profile that no Phase type can use, with each type's reasons."""
     reasons = {
-        phase_type: phase_type_errors(profile, phase_type)
+        phase_type: phase_type_errors(profile, phase_type, max_score)
         for phase_type in PHASE_TYPES
     }
     if not all(reasons.values()):
@@ -163,7 +167,7 @@ def _sentence(errors):
     return "; ".join(error.rstrip(".") for error in errors) + "."
 
 
-def phase_type_errors(profile, phase_type):
+def phase_type_errors(profile, phase_type, max_score=None):
     """Return why Phases of ``phase_type`` cannot use ``profile``.
 
     Rankings are checked without a Phase's beneficiary_data_schema, which only
@@ -190,7 +194,9 @@ def phase_type_errors(profile, phase_type):
             )
     if "ranking" in profile:
         model = Group if phase_type == "GROUP" else Individual
-        errors.extend(ranking_errors(profile["ranking"], model, path="ranking"))
+        errors.extend(ranking_errors(
+            profile["ranking"], model, path="ranking", max_score=max_score
+        ))
     return errors
 
 
