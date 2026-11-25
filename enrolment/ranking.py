@@ -1,8 +1,10 @@
 import json
 import math
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.db import DataError
@@ -229,7 +231,11 @@ def _validate_score_source(score_source, model):
         )
 
 
-def _validate_scoring(scoring, path):
+def validate_scoring(scoring, path="scoring"):
+    """Check a component's ``scoring`` (``mapping`` or ``numeric_bands``); raises ValidationError naming ``path``.
+
+    Public so other modules can keep score rules in the same shape as enrolment.
+    """
     if not isinstance(scoring, dict):
         raise ValidationError(f"{path} must be an object.")
     scoring_type = scoring.get("type")
@@ -314,6 +320,9 @@ def _validate_scoring(scoring, path):
         raise ValidationError(
             f"{path}.maximum_points cannot be smaller than configured points."
         )
+
+
+_validate_scoring = validate_scoring
 
 
 def _phase_type(model):
@@ -463,7 +472,7 @@ def _normalise_selection_strategy(selection_strategy, model):
         raise ValidationError(
             "enrolment_ranking.selection_strategy must be an object."
         )
-    allowed = {"source", "quotas", *SHORTHAND_QUOTA_KEYS}
+    allowed = {"source", "quotas", "spillover", *SHORTHAND_QUOTA_KEYS}
     unexpected = set(selection_strategy) - allowed
     if unexpected:
         raise ValidationError(
@@ -494,7 +503,19 @@ def _normalise_selection_strategy(selection_strategy, model):
     else:
         quotas = _shorthand_quotas(selection_strategy)
 
-    return {"source": source, "quotas": quotas}
+    spillover = selection_strategy.get("spillover", True)
+    if not isinstance(spillover, bool):
+        raise ValidationError(
+            "enrolment_ranking.selection_strategy.spillover must be true or false."
+        )
+    return {"source": source, "quotas": quotas, "spillover": spillover}
+
+
+def normalise_selection_strategy(selection_strategy, model):
+    """Validate a ``selection_strategy`` for candidates of ``model`` (Individual
+    or Group) and return it normalised: ``source``, ``quotas`` and ``spillover``.
+    Raises ValidationError naming the first problem."""
+    return _normalise_selection_strategy(selection_strategy, model)
 
 
 def _shorthand_quotas(selection_strategy):
@@ -630,7 +651,7 @@ def _normalise_quota_condition(condition, path, source):
     if not isinstance(condition, dict):
         raise ValidationError(f"{path} must be an object.")
     unexpected = set(condition) - {
-        "subject", "field", "derived", "filter", "type", "value",
+        "subject", "field", "derived", "filter", "type", "value", "answer", "location_type",
     }
     if unexpected:
         raise ValidationError(
@@ -704,11 +725,38 @@ def _normalise_district_condition(condition, path):
     return {"derived": "district", "filter": filter_name, "value": value}
 
 
+def _normalise_location_code_condition(condition, path):
+    """An answer (json_ext key) holding a location code: the code given or any code it replaced."""
+    from location.apps import LocationConfig
+
+    answer, location_type, value = condition.get("answer"), condition.get("location_type"), condition.get("value")
+    if not isinstance(answer, str) or not answer.strip() or "__" in answer or "=" in answer:
+        raise ValidationError(f"{path}.answer must be the json_ext key holding the location code.")
+    if location_type not in (LocationConfig.location_types or []):
+        raise ValidationError(
+            f"{path}.location_type must be one of " + ", ".join(LocationConfig.location_types or []) + "."
+        )
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{path}.value must be a location code.")
+    if condition.get("filter", "exact") != "exact" or condition.get("type", "string") != "string":
+        raise ValidationError(f"{path} matches a location code exactly; leave out filter and type.")
+    return {"derived": "location_code", "answer": answer, "location_type": location_type, "value": value.strip()}
+
+
+def location_code_q(condition, prefix=""):
+    """Rows whose answer holds the condition's code or a code it replaced (enrolment.locations)."""
+    from enrolment.locations import location_codes
+
+    codes = location_codes(condition["location_type"], condition["value"])
+    return Q(**{f"{prefix}json_ext__{condition['answer']}__in": codes})
+
+
 # Derived values a condition may read in place of a json_ext field, in quota
 # conditions and profile eligibility criteria: name -> normaliser.
 DERIVED_CONDITION_VALUES = {
     "age": _normalise_age_condition,
     "district": _normalise_district_condition,
+    "location_code": _normalise_location_code_condition,
 }
 
 
@@ -729,6 +777,8 @@ def derived_condition_q(condition, model):
     """
     if condition["derived"] == "age":
         return _age_condition_q("dob", condition["filter"], condition["value"])
+    if condition["derived"] == "location_code":
+        return location_code_q(condition)
     matching = in_district(model.objects.all(), condition["filter"], condition["value"])
     return Q(pk__in=matching.values("pk"))
 
@@ -873,7 +923,8 @@ def ranking_errors(rankings, model, beneficiary_schema=None, path="enrolment_ran
     return errors
 
 
-def _maximum_points(scoring):
+def maximum_points(scoring):
+    """The most points ``scoring`` can give: its ``maximum_points``, else its highest configured points."""
     if scoring.get("maximum_points") is not None:
         return scoring["maximum_points"]
     if scoring["type"] == "mapping":
@@ -881,6 +932,9 @@ def _maximum_points(scoring):
     else:
         points = [band["points"] for band in scoring["bands"]]
     return max([scoring.get("default", 0), *points])
+
+
+_maximum_points = maximum_points
 
 
 def _value_expression(component, prefix=""):
@@ -955,6 +1009,118 @@ def _points_case(value_alias, component):
         default=Value(float(scoring.get("default", 0))),
         output_field=FloatField(),
     )
+
+
+def _jsonb_number(value):
+    """A JSON number as Postgres prints it (numeric output: no exponent, no negative zero)."""
+    number = Decimal(json.dumps(value))
+    if not number.is_finite():
+        raise ValueError(f"{value!r} is not a JSON number.")
+    text = format(number, "f")
+    return text[1:] if number.is_zero() and text.startswith("-") else text
+
+
+def _jsonb_string(text):
+    escapes = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r",
+               "\t": "\\t"}
+    return '"' + "".join(escapes.get(c, f"\\u{ord(c):04x}" if ord(c) < 0x20 else c) for c in text) + '"'
+
+
+def _jsonb_text(value):
+    """``value`` serialised as Postgres prints a jsonb value: ", " and ": " separators, non-ASCII kept, object keys
+    ordered by byte length then bytes."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return _jsonb_number(value)
+    if isinstance(value, str):
+        return _jsonb_string(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_jsonb_text(item) for item in value) + "]"
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: (len(str(key).encode()), str(key).encode()))
+        return "{" + ", ".join(f"{_jsonb_string(str(key))}: {_jsonb_text(value[key])}" for key in keys) + "}"
+    raise ValueError(f"{value!r} is not a JSON value.")
+
+
+def _json_text(value):
+    """``value`` as Postgres gives a json_ext key as text (``->>``), which mapping keys are compared with."""
+    if isinstance(value, str):
+        return value
+    return _jsonb_text(value)
+
+
+_FLOAT8_DECIMAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
+_FLOAT8_HEX = re.compile(r"[+-]?0[xX]([0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)([pP][+-]?\d+)?", re.ASCII)
+_FLOAT8_SPECIAL = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE | re.ASCII)
+_FLOAT8_SPACE = " \t\n\r\f\v"
+
+
+def _float8(value):
+    """``value`` cast to double precision as Postgres casts json_ext text; ValueError where the cast fails."""
+    text = _json_text(value).strip(_FLOAT8_SPACE)
+    if _FLOAT8_SPECIAL.fullmatch(text):
+        return float(text.lower().replace("infinity", "inf"))
+    if _FLOAT8_HEX.fullmatch(text):
+        try:
+            number = float.fromhex(text)
+        except OverflowError:
+            raise ValueError(f'"{text}" is out of range for type double precision')
+        nonzero = any(digit not in "0." for digit in re.split("[pP]", text.lstrip("+-")[2:])[0])
+    elif _FLOAT8_DECIMAL.fullmatch(text):
+        number = float(text)
+        nonzero = Decimal(text) != 0
+    else:
+        raise ValueError(f'invalid input syntax for type double precision: "{text}"')
+    if math.isinf(number) or (number == 0 and nonzero):
+        raise ValueError(f'"{text}" is out of range for type double precision')
+    return number
+
+
+def _band_matches(band, value, derived):
+    if derived == "age":
+        # Same date-of-birth bounds as _age_condition_q, so a birthday counts the same way.
+        today = age_reference_date()
+        return ("min" not in band or value <= _years_ago_boundary(today, band["min"])) and (
+            "max" not in band or value >= _age_range_dob(today, 0, band["max"])[0])
+    if math.isnan(value):
+        # Postgres orders NaN above every number
+        return "max" not in band
+    return ("min" not in band or value >= band["min"]) and ("max" not in band or value <= band["max"])
+
+
+def component_points(component, value):
+    """The points a weighted_score component gives ``value``, the same as build_weighted_score works out in SQL.
+
+    ``value`` is what the component reads: the json_ext answer for a ``field`` component, the date of birth
+    for ``derived: age`` (ages on age_reference_date()), the district name for ``derived: district``. None,
+    like a missing key, scores the default. Mapping keys are compared with the value's jsonb text, and a
+    numeric_bands value is read as Postgres casts it to double precision: ValueError where that cast fails,
+    and NaN above every number.
+    """
+    scoring = component["scoring"]
+    default = float(scoring.get("default", 0))
+    if value is None:
+        return default
+    if scoring["type"] == "mapping":
+        points = scoring["values"].get(_json_text(value))
+        return default if points is None else float(points)
+    derived = component.get("derived")
+    if derived == "age":
+        if isinstance(value, datetime):
+            value = value.date()
+        if not isinstance(value, date):
+            raise ValueError(f"derived age needs a date of birth, not {value!r}.")
+    else:
+        if isinstance(value, bool):
+            raise ValueError(f"{value!r} is not a number.")
+        value = _float8(value)
+    for band in scoring["bands"]:
+        if _band_matches(band, value, derived):
+            return float(band["points"])
+    return default
 
 
 def _best_member_points(component):
@@ -1102,10 +1268,18 @@ def _district_quota_q(condition):
     return Q(_selection_individual__in=matching.values("id"))
 
 
+def _location_code_quota_q(condition):
+    """Match source people whose answer holds the code or a code it replaced."""
+    from individual.models import Individual
+
+    return Q(_selection_individual__in=Individual.objects.filter(location_code_q(condition)).values("id"))
+
+
 # How each derived value filters the annotated selection source of a quota.
 DERIVED_QUOTA_FILTERS = {
     "age": _age_quota_q,
     "district": _district_quota_q,
+    "location_code": _location_code_quota_q,
 }
 
 
@@ -1131,52 +1305,74 @@ def _quota_q(conditions):
     return query
 
 
+def allocate_places(ranked_ids, quotas, members, cap, spillover=True):
+    """Fill quota buckets in order from ``ranked_ids`` (best first), then, with
+    ``spillover``, the remaining places from the next ranked candidates.
+
+    ``members`` maps each quota key to the ids its conditions match. A bucket
+    reserves its ``count``, or ``percentage`` of ``cap`` rounded down, and never
+    more than the places left. One candidate occupies at most one place.
+
+    Returns the selected ids in the order they were placed and how the places
+    filled: for each bucket the places it reserved and filled, and how many went
+    to the next ranked candidates (``unreserved``).
+    """
+    selected, taken, buckets = [], set(), []
+    for quota in quotas:
+        target = quota.get("count")
+        if target is None:
+            target = math.floor(cap * quota["percentage"] / 100)
+        target = max(0, min(target, cap - len(selected)))
+        eligible = members.get(quota["key"], ())
+        filled = []
+        if target:
+            for candidate in ranked_ids:
+                if candidate not in taken and candidate in eligible:
+                    filled.append(candidate)
+                    taken.add(candidate)
+                    if len(filled) == target:
+                        break
+        selected.extend(filled)
+        buckets.append({"key": quota["key"], "reserved": target, "filled": len(filled)})
+
+    unreserved = []
+    # Without spillover, places a bucket leaves unfilled stay empty
+    if spillover:
+        remaining = cap - len(selected)
+        for candidate in ranked_ids:
+            if remaining <= 0:
+                break
+            if candidate not in taken:
+                unreserved.append(candidate)
+                taken.add(candidate)
+                remaining -= 1
+        selected.extend(unreserved)
+    return selected, {"buckets": buckets, "unreserved": len(unreserved)}
+
+
+def quota_members(candidates, quotas, source=SELF_SOURCE):
+    """{quota key: set of candidate ids} of the ``candidates`` queryset
+    (Individuals for SELF, Groups otherwise) each quota's conditions match."""
+    annotated = _annotate_selection_source(candidates, source)
+    return {
+        quota["key"]: set(annotated.filter(_quota_q(quota["when"])).values_list("id", flat=True))
+        for quota in quotas
+    }
+
+
 def _select_quota_ids(ranked, selection_strategy, cap):
-    """Fill quota buckets in order, then the remaining places from the ranked list.
+    """Select ``cap`` places from the ranked queryset by its selection strategy.
 
-    ``ranked`` already carries the configured weighted/deterministic ordering.
-    Each bucket and the fallback retain that ordering, and exclusions ensure one
-    beneficiary cannot occupy more than one place.
-
-    Returns the selected ids and how the places filled: for each bucket the
-    places it reserved and filled, and how many went to the next ranked
-    candidates (``unreserved``).
+    ``ranked`` already carries the configured weighted/deterministic ordering,
+    which the buckets and the fallback keep (allocate_places).
     """
     strategy = _normalise_selection_strategy(
         selection_strategy,
         ranked.model,
     )
-    candidates = _annotate_selection_source(ranked, strategy["source"])
-    selected_ids = []
-    buckets = []
-
-    for quota in strategy["quotas"]:
-        target = quota.get("count")
-        if target is None:
-            target = math.floor(cap * quota["percentage"] / 100)
-        target = max(0, min(target, cap - len(selected_ids)))
-        filled = []
-        if target:
-            filled = list(
-                candidates.exclude(id__in=selected_ids).filter(
-                    _quota_q(quota["when"])
-                ).values_list("id", flat=True)[:target]
-            )
-            selected_ids.extend(filled)
-        buckets.append({"key": quota["key"], "reserved": target, "filled": len(filled)})
-
-    # Places the buckets leave unfilled always go to the next ranked candidates,
-    # so the Phase reaches its target whenever enough candidates are eligible.
-    remaining = cap - len(selected_ids)
-    unreserved = []
-    if remaining:
-        unreserved = list(
-            candidates.exclude(id__in=selected_ids).values_list(
-                "id", flat=True
-            )[:remaining]
-        )
-        selected_ids.extend(unreserved)
-    return selected_ids, {"buckets": buckets, "unreserved": len(unreserved)}
+    ranked_ids = list(ranked.values_list("id", flat=True))
+    members = quota_members(ranked, strategy["quotas"], strategy["source"])
+    return allocate_places(ranked_ids, strategy["quotas"], members, cap, strategy["spillover"])
 
 
 def calculate_cap(
